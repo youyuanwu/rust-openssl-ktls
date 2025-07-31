@@ -1,0 +1,17 @@
+[package]
+name = "openssl-ktls"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+openssl = { workspace = true, features = ["vendored"] , default-features = false}
+openssl-sys = { workspace = true, features = ["vendored"] , default-features = false}
+foreign-types-shared.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+
+[features]
+default = []
+
+
+[build-dependencies]
+openssl-src = { version = "*", features = ["ktls", "legacy"], default-features = false }

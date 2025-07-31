@@ -1,0 +1,38 @@
+name: build
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ ubuntu-latest ]
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install rust stable
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: 1.88.0
+        components: rustfmt, clippy
+
+    - uses: taiki-e/install-action@cargo-llvm-cov
+
+    - name: Run cargo check
+      run: cargo check
+
+    - name: Run cargo fmt
+      run: cargo fmt --all -- --check
+    
+    - name: Run cargo clippy
+      run: cargo clippy --all-targets -- -D warnings
+    
+    - name: Run cargo test
+      run: cargo test --all -- --nocapture
+
+    - name: Run llvm-cov
+      run: cargo llvm-cov --codecov --output-path codecov.json
+
+    - name: Show cov summary
+      run: cargo llvm-cov report --summary-only
