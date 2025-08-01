@@ -11,7 +11,7 @@ pub const BIO_C_GET_BUF_MEM_PTR: c_int = 115;
 pub const BIO_CTRL_FLUSH: c_int = 11;
 pub const BIO_C_DO_STATE_MACHINE: c_int = 101;
 
-pub const SSL_OP_ENABLE_KTLS: u64 = 0x00000008;
+pub(crate) const SSL_OP_ENABLE_KTLS: u64 = 0x00000008;
 
 unsafe extern "C" {
     pub unsafe fn BIO_free(b: *mut openssl_sys::BIO);
@@ -124,7 +124,7 @@ mod tests {
     use openssl::base64;
     use openssl_sys::{BIO_free_all, BIO_new, BIO_s_mem, BIO_write};
 
-    use crate::kbio::ffi::{BIO_f_base64, BIO_flush, BIO_get_mem_ptr, BIO_push, BUF_MEM};
+    use crate::bio::ffi::{BIO_f_base64, BIO_flush, BIO_get_mem_ptr, BIO_push, BUF_MEM};
 
     #[test]
     fn test_bio_layers() {
@@ -162,8 +162,8 @@ mod tests {
         use openssl::ssl::{SslContext, SslMethod};
         use openssl_sys::BIO_new_socket;
 
-        use crate::kbio::bio_socket::BIOSocketStream;
-        use crate::kbio::ffi::{
+        use crate::SslStream;
+        use crate::bio::ffi::{
             BIO_NOCLOSE, BIO_do_connect, BIO_f_null, BIO_free, BIO_new_connect, BIO_push,
             SSL_OP_ENABLE_KTLS,
         };
@@ -464,9 +464,6 @@ mod tests {
                 }
             };
 
-            // Get the raw file descriptor
-            let fd = tcp_stream.as_raw_fd();
-
             // Create SSL object using the KTLS-enabled context with high-level API
             let ssl = match openssl::ssl::Ssl::new(&ctx) {
                 Ok(ssl) => ssl,
@@ -477,7 +474,7 @@ mod tests {
             };
 
             // Create BIOSocketStream with SSL and socket file descriptor
-            let bio_socket_stream = unsafe { BIOSocketStream::new(fd, ssl) };
+            let bio_socket_stream = SslStream::new(tcp_stream, ssl);
 
             // Set SNI hostname
             let sni_hostname = c"httpbin.org".as_ptr() as *mut c_char;

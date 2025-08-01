@@ -1,53 +1,7 @@
-use std::{io, mem, os::fd::AsRawFd};
-
-use libc::{SOL_TCP, SOL_TLS, TCP_ULP, TLS_RX, TLS_TX, tls12_crypto_info_aes_gcm_128};
-use openssl_ktls::kbio::ffi::SSL_OP_ENABLE_KTLS;
+use openssl_ktls::option::SSL_OP_ENABLE_KTLS;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::utils::{HELLO, create_openssl_acceptor_builder, create_openssl_connector_with_ktls};
-
-#[allow(dead_code)]
-unsafe fn set_sock(
-    socket: &std::net::TcpStream,
-    tx: &tls12_crypto_info_aes_gcm_128,
-    rx: &tls12_crypto_info_aes_gcm_128,
-) -> io::Result<()> {
-    const INFO_SIZE: usize = mem::size_of::<tls12_crypto_info_aes_gcm_128>();
-
-    let socket = socket.as_raw_fd();
-
-    if unsafe { libc::setsockopt(socket, SOL_TCP, TCP_ULP, c"tls".as_ptr() as _, 4) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    if unsafe {
-        libc::setsockopt(
-            socket,
-            SOL_TLS,
-            TLS_TX as _,
-            tx as *const _ as _,
-            INFO_SIZE as _,
-        )
-    } < 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-
-    if unsafe {
-        libc::setsockopt(
-            socket,
-            SOL_TLS,
-            TLS_RX as _,
-            rx as *const _ as _,
-            INFO_SIZE as _,
-        )
-    } < 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok(())
-}
 
 #[tokio::test]
 async fn async_ktls_test() {
@@ -57,16 +11,10 @@ async fn async_ktls_test() {
     let (cert, key_pair) =
         crate::utils::ssl_gen::mk_self_signed_cert(vec!["localhost".to_string()]).unwrap();
 
-    let ssl_acpt_builder = create_openssl_acceptor_builder(&cert, &key_pair);
+    let mut ssl_acpt_builder = create_openssl_acceptor_builder(&cert, &key_pair);
 
-    // Set ktls and KTLS-compatible ciphers for TLS 1.2
-    let ptr = ssl_acpt_builder.as_ptr();
-    unsafe {
-        openssl_sys::SSL_CTX_set_options(ptr, SSL_OP_ENABLE_KTLS);
-        // Use TLS 1.2 with KTLS-compatible cipher suite
-        let cipher_list = std::ffi::CString::new("ECDHE-RSA-AES128-GCM-SHA256").unwrap();
-        openssl_sys::SSL_CTX_set_cipher_list(ptr, cipher_list.as_ptr());
-    };
+    // Set ktls
+    ssl_acpt_builder.set_options(SSL_OP_ENABLE_KTLS);
 
     let ssl_acpt = ssl_acpt_builder.build();
 
@@ -84,28 +32,15 @@ async fn async_ktls_test() {
         let ssl = openssl::ssl::Ssl::new(ssl_ctx).unwrap();
 
         println!("creating async bio socket stream for server");
-        let mut ssl_s = openssl_ktls::kbio::create_async_bio_socket_stream(tcp_stream, ssl)
-            .await
-            .unwrap();
+        let mut ssl_s = openssl_ktls::TokioSslStream::new(tcp_stream, ssl).unwrap();
 
         println!("accept server ssl");
         ssl_s.accept().await.unwrap();
 
         // Check KTLS on server side
-        println!("checking KTLS on server side");
-        let send_enabled = {
-            use foreign_types_shared::ForeignTypeRef;
-            let wbio = unsafe { openssl_sys::SSL_get_wbio(ssl_s.ssl().as_ptr()) };
-            println!("Server wbio ptr: {wbio:?}");
-            println!(
-                "Server cipher: {:?}",
-                ssl_s.ssl().current_cipher().map(|c| c.name())
-            );
-            println!("Server version: {:?}", ssl_s.ssl().version_str());
-
-            unsafe { openssl_ktls::kbio::ffi::BIO_get_ktls_send(wbio) }
-        };
-        println!("Server KTLS send enabled: {send_enabled}");
+        let receive_enabled = ssl_s.ktls_recv_enabled();
+        let send_enabled = ssl_s.ktls_send_enabled();
+        println!("Server KTLS send enabled: {send_enabled}, recv enabled: {receive_enabled}");
 
         println!("server read");
         let mut buf = [0_u8; 100];
@@ -132,28 +67,16 @@ async fn async_ktls_test() {
         let ssl = ssl_con.into_ssl("localhost").unwrap();
 
         println!("creating async bio socket stream for client");
-        let mut ssl_s = openssl_ktls::kbio::create_async_bio_socket_stream(tcp_stream, ssl)
-            .await
-            .unwrap();
+        let mut ssl_s = openssl_ktls::TokioSslStream::new(tcp_stream, ssl).unwrap();
 
         println!("client ssl conn");
         ssl_s.connect().await.unwrap();
 
         // Debug: Check all BIOs in the chain
         println!("checking KTLS on client side");
-        let client_send = {
-            use foreign_types_shared::ForeignTypeRef;
-            let rbio = unsafe { openssl_sys::SSL_get_rbio(ssl_s.ssl().as_ptr()) };
-            println!("Client rbio ptr: {rbio:?}");
-            println!(
-                "Client cipher: {:?}",
-                ssl_s.ssl().current_cipher().map(|c| c.name())
-            );
-            println!("Client version: {:?}", ssl_s.ssl().version_str());
-
-            unsafe { openssl_ktls::kbio::ffi::BIO_get_ktls_send(rbio) }
-        };
-        println!("KTLS send enabled on client: {client_send}");
+        let receive_enabled = ssl_s.ktls_recv_enabled();
+        let send_enabled = ssl_s.ktls_send_enabled();
+        println!("Client KTLS send enabled: {send_enabled}, recv enabled: {receive_enabled}");
 
         println!("client ssl write");
         let len = ssl_s.write(HELLO.as_bytes()).await.unwrap();

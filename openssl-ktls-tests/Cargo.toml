@@ -5,14 +5,10 @@ edition = "2024"
 publish = false
 
 [dependencies]
-tokio-util.workspace = true
 tokio.workspace = true
 openssl = { workspace = true, features = ["vendored"] , default-features = false}
 openssl-sys = { workspace = true, features = ["vendored"] , default-features = false}
-foreign-types-shared.workspace = true
 openssl-ktls.workspace = true
-libc.workspace = true
-futures.workspace = true
 
 [build-dependencies]
-openssl-src = { version = "*", features = ["ktls", "legacy"], default-features = false }
+openssl-src = { workspace = true, features = ["ktls"], default-features = false }

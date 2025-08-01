@@ -1,60 +1,35 @@
-use std::os::fd::RawFd;
+use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use openssl_sys::BIO;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::kbio::ffi::BIO_NOCLOSE;
+use crate::bio::ffi::BIO_NOCLOSE;
 use foreign_types_shared::ForeignType;
 
-// Send-safe wrapper for BIO pointer
-#[allow(dead_code)]
-struct SendBio(*mut BIO);
-unsafe impl Send for SendBio {}
-unsafe impl Sync for SendBio {}
-
-/// Async version of BIOSocketStream that integrates with Tokio runtime
-pub struct AsyncBIOSocketStream {
+/// Async version of SslStream that integrates with Tokio runtime
+pub struct SslStream {
+    async_fd: AsyncFd<std::net::TcpStream>, // Use TcpStream as a wrapper for the raw fd
     ssl: openssl::ssl::Ssl,
-    _bio: SendBio,
-    async_fd: AsyncFd<std::fs::File>, // Use File as a wrapper for the raw fd
 }
 
-// Safety: The BIO pointer is owned by the SSL object and properly managed by OpenSSL.
-// The SSL object itself is Send + Sync, and we never access the BIO pointer directly
-// from multiple threads simultaneously.
-unsafe impl Send for AsyncBIOSocketStream {}
-unsafe impl Sync for AsyncBIOSocketStream {}
-
-impl AsyncBIOSocketStream {
-    /// Create a new AsyncBIOSocketStream from a raw file descriptor and SSL object.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that:
-    /// - `fd` is a valid file descriptor for a non-blocking socket
-    /// - The file descriptor remains valid for the lifetime of this object
-    /// - The SSL object is properly configured and compatible with socket operations
-    /// - The underlying socket is set to non-blocking mode
-    pub unsafe fn new(fd: RawFd, ssl: openssl::ssl::Ssl) -> std::io::Result<Self> {
-        let sock_bio = unsafe { openssl_sys::BIO_new_socket(fd, BIO_NOCLOSE) };
+impl SslStream {
+    /// Create a new SslStream from a raw file descriptor and SSL object.
+    pub fn new(tcp_stream: tokio::net::TcpStream, ssl: openssl::ssl::Ssl) -> std::io::Result<Self> {
+        // Convert to std tcp stream so that tokio has no track of the tcp,
+        // and we will register with tokio using AsyncFd again.
+        let std_tcp = tcp_stream.into_std().unwrap();
+        let sock_bio = unsafe { openssl_sys::BIO_new_socket(std_tcp.as_raw_fd(), BIO_NOCLOSE) };
         assert!(!sock_bio.is_null(), "Failed to create socket BIO");
         unsafe {
             openssl_sys::SSL_set_bio(ssl.as_ptr(), sock_bio, sock_bio);
         }
 
-        // Create a File from the raw fd for AsyncFd
-        use std::os::fd::FromRawFd;
-        let file = unsafe { std::fs::File::from_raw_fd(fd) };
-        let async_fd = AsyncFd::new(file)?;
+        // Create a AsyncFd for tcp stream
+        let async_fd = AsyncFd::new(std_tcp)?;
 
-        Ok(AsyncBIOSocketStream {
-            _bio: SendBio(sock_bio),
-            ssl,
-            async_fd,
-        })
+        Ok(SslStream { ssl, async_fd })
     }
 
     /// Async SSL connect
@@ -218,9 +193,23 @@ impl AsyncBIOSocketStream {
     pub fn ssl(&self) -> &openssl::ssl::Ssl {
         &self.ssl
     }
+
+    pub fn ktls_send_enabled(&self) -> bool {
+        unsafe {
+            let wbio = openssl_sys::SSL_get_wbio(self.ssl.as_ptr());
+            crate::bio::ffi::BIO_get_ktls_send(wbio) != 0
+        }
+    }
+
+    pub fn ktls_recv_enabled(&self) -> bool {
+        unsafe {
+            let rbio = openssl_sys::SSL_get_rbio(self.ssl.as_ptr());
+            crate::bio::ffi::BIO_get_ktls_recv(rbio) != 0
+        }
+    }
 }
 
-impl AsyncRead for AsyncBIOSocketStream {
+impl AsyncRead for SslStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -278,7 +267,7 @@ impl AsyncRead for AsyncBIOSocketStream {
     }
 }
 
-impl AsyncWrite for AsyncBIOSocketStream {
+impl AsyncWrite for SslStream {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -345,7 +334,7 @@ impl AsyncWrite for AsyncBIOSocketStream {
     }
 }
 
-impl Drop for AsyncBIOSocketStream {
+impl Drop for SslStream {
     fn drop(&mut self) {
         // The BIO is automatically freed when SSL_free is called on the SSL object,
         // so we don't need to manually free the BIO here. The SSL object will be
@@ -354,29 +343,4 @@ impl Drop for AsyncBIOSocketStream {
         // Note: We used SSL_set_bio(ssl, bio, bio) which means both read and write
         // BIOs point to the same BIO object, and SSL takes ownership of it.
     }
-}
-
-/// Helper function to create an async BIO socket stream with proper setup
-pub async fn create_async_bio_socket_stream(
-    tcp_stream: tokio::net::TcpStream,
-    ssl: openssl::ssl::Ssl,
-) -> Result<AsyncBIOSocketStream, std::io::Error> {
-    use std::os::fd::AsRawFd;
-
-    // Convert tokio TcpStream to std TcpStream
-    let std_stream = tcp_stream.into_std()?;
-
-    // Set to non-blocking mode (required for async operations)
-    std_stream.set_nonblocking(true)?;
-
-    // Get file descriptor
-    let fd = std_stream.as_raw_fd();
-
-    // Create the async BIO socket stream
-    let bio_stream = unsafe { AsyncBIOSocketStream::new(fd, ssl)? };
-
-    // Keep the std_stream alive by forgetting it (BIO will manage the fd)
-    std::mem::forget(std_stream);
-
-    Ok(bio_stream)
 }

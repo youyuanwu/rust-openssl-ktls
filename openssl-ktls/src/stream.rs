@@ -1,15 +1,13 @@
-use std::os::fd::RawFd;
+use std::os::fd::AsRawFd;
 
-use openssl_sys::BIO;
-
-use crate::kbio::ffi::BIO_NOCLOSE;
+use crate::bio::ffi::BIO_NOCLOSE;
 use foreign_types_shared::ForeignType;
 
-pub struct BIOSocketStream {
+pub struct SslStream {
+    _tcp: std::net::TcpStream,
     ssl: openssl::ssl::Ssl,
-    _bio: *mut BIO,
 }
-impl BIOSocketStream {
+impl SslStream {
     /// Create a new BIOSocketStream from a raw file descriptor and SSL object.
     ///
     /// # Safety
@@ -18,16 +16,13 @@ impl BIOSocketStream {
     /// - `fd` is a valid file descriptor
     /// - The file descriptor remains valid for the lifetime of this object
     /// - The SSL object is properly configured and compatible with socket operations
-    pub unsafe fn new(fd: RawFd, ssl: openssl::ssl::Ssl) -> Self {
-        let sock_bio = unsafe { openssl_sys::BIO_new_socket(fd, BIO_NOCLOSE) };
+    pub fn new(tcp: std::net::TcpStream, ssl: openssl::ssl::Ssl) -> Self {
+        let sock_bio = unsafe { openssl_sys::BIO_new_socket(tcp.as_raw_fd(), BIO_NOCLOSE) };
         assert!(!sock_bio.is_null(), "Failed to create socket BIO");
         unsafe {
             openssl_sys::SSL_set_bio(ssl.as_ptr(), sock_bio, sock_bio);
         }
-        BIOSocketStream {
-            _bio: sock_bio,
-            ssl,
-        }
+        SslStream { _tcp: tcp, ssl }
     }
 
     /// Synchronous connect method (kept for backward compatibility)
@@ -61,9 +56,23 @@ impl BIOSocketStream {
             Ok(())
         }
     }
+
+    pub fn ktls_send_enabled(&self) -> bool {
+        unsafe {
+            let wbio = openssl_sys::SSL_get_wbio(self.ssl.as_ptr());
+            crate::bio::ffi::BIO_get_ktls_send(wbio) != 0
+        }
+    }
+
+    pub fn ktls_recv_enabled(&self) -> bool {
+        unsafe {
+            let rbio = openssl_sys::SSL_get_rbio(self.ssl.as_ptr());
+            crate::bio::ffi::BIO_get_ktls_recv(rbio) != 0
+        }
+    }
 }
 
-impl std::io::Read for BIOSocketStream {
+impl std::io::Read for SslStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         unsafe {
             let len = openssl_sys::SSL_read(
@@ -80,7 +89,7 @@ impl std::io::Read for BIOSocketStream {
     }
 }
 
-impl std::io::Write for BIOSocketStream {
+impl std::io::Write for SslStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -105,7 +114,7 @@ impl std::io::Write for BIOSocketStream {
     }
 }
 
-impl Drop for BIOSocketStream {
+impl Drop for SslStream {
     fn drop(&mut self) {
         // The BIO is automatically freed when SSL_free is called on the SSL object,
         // so we don't need to manually free the BIO here. The SSL object will be

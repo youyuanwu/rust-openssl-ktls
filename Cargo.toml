@@ -4,17 +4,11 @@ members = [ "openssl-ktls", "openssl-ktls-tests"]
 
 [workspace.dependencies]
 foreign-types-shared = "0.1"
-tonic = "0.13"
-prost = "0.13"
 tokio-uring = { version = "0.5.0" }
-tonic-build = "0.13"
 tokio = { version = "1.40", features = ["full"] }
-tokio-util = { version = "0.7", default-features = false }
 openssl = { version = "0.10", default-features = false }
 openssl-sys = { version = "0.9", default-features = false }
-openssl-src = { version = "*", features = ["ktls", "legacy"], default-features = false }
-libc = "0.2"
-futures = "0.3"
+openssl-src = { version = "300", features = ["ktls"], default-features = false }
 
 # crate in this workspace
 openssl-ktls = { path = "openssl-ktls" }

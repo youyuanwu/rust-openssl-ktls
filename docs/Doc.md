@@ -2,6 +2,10 @@
 
 openssl on ubuntu does not have ktls.
 ```sh
+# check kmod
+lsmod | grep tls
+sudo modprobe tls
+
 # remove system install 
 sudo apt remove libssl-dev 
 # insall from vcpkg
