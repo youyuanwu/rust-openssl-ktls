@@ -15,3 +15,5 @@ pub use stream::SslStream;
 pub mod tokio_stream;
 #[cfg(feature = "tokio")]
 pub type TokioSslStream = tokio_stream::SslStream;
+
+pub mod error;

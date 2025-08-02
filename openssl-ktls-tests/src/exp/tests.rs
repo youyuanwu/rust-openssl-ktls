@@ -1,4 +1,3 @@
-
 use openssl::base64;
 use openssl_sys::{BIO_free_all, BIO_new, BIO_s_mem, BIO_write};
 
