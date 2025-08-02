@@ -9,6 +9,7 @@ tokio.workspace = true
 openssl = { workspace = true, features = ["vendored"] , default-features = false}
 openssl-sys = { workspace = true, features = ["vendored"] , default-features = false}
 openssl-ktls.workspace = true
+foreign-types-shared.workspace = true
 
 [build-dependencies]
 openssl-src = { workspace = true, features = ["ktls"], default-features = false }

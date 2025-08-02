@@ -184,6 +184,7 @@ dependencies = [
 name = "openssl-ktls-tests"
 version = "0.1.0"
 dependencies = [
+ "foreign-types-shared",
  "openssl",
  "openssl-ktls",
  "openssl-src",

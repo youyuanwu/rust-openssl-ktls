@@ -5,7 +5,7 @@ use std::task::{Context, Poll};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::bio::ffi::BIO_NOCLOSE;
+use crate::ffi::BIO_NOCLOSE;
 use foreign_types_shared::ForeignType;
 
 /// Async version of SslStream that integrates with Tokio runtime
@@ -197,14 +197,14 @@ impl SslStream {
     pub fn ktls_send_enabled(&self) -> bool {
         unsafe {
             let wbio = openssl_sys::SSL_get_wbio(self.ssl.as_ptr());
-            crate::bio::ffi::BIO_get_ktls_send(wbio) != 0
+            crate::ffi::BIO_get_ktls_send(wbio) != 0
         }
     }
 
     pub fn ktls_recv_enabled(&self) -> bool {
         unsafe {
             let rbio = openssl_sys::SSL_get_rbio(self.ssl.as_ptr());
-            crate::bio::ffi::BIO_get_ktls_recv(rbio) != 0
+            crate::ffi::BIO_get_ktls_recv(rbio) != 0
         }
     }
 }

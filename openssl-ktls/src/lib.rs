@@ -5,7 +5,7 @@
 //! The BIO blocks the ctrl messages that needs to be passed down to
 //! the next BIO layer.
 
-pub mod bio;
+pub mod ffi;
 
 pub mod option;
 mod stream;
