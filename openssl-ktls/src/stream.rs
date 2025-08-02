@@ -75,7 +75,10 @@ impl std::io::Read for SslStream {
                 buf.len().try_into().unwrap(),
             );
             if len < 0 {
-                Err(std::io::Error::last_os_error())
+                Err(std::io::Error::other(crate::error::Error::make(
+                    len,
+                    self.ssl(),
+                )))
             } else {
                 Ok(len as usize)
             }
@@ -96,7 +99,10 @@ impl std::io::Write for SslStream {
                 buf.len().try_into().unwrap(),
             );
             if len < 0 {
-                Err(std::io::Error::last_os_error())
+                Err(std::io::Error::other(crate::error::Error::make(
+                    len,
+                    self.ssl(),
+                )))
             } else {
                 Ok(len as usize)
             }
