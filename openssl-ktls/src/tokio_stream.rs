@@ -5,7 +5,8 @@ use std::task::{Context, Poll};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::bio::ffi::BIO_NOCLOSE;
+use crate::error::Error;
+use crate::ffi::BIO_NOCLOSE;
 use foreign_types_shared::ForeignType;
 
 /// Async version of SslStream that integrates with Tokio runtime
@@ -33,7 +34,7 @@ impl SslStream {
     }
 
     /// Async SSL connect
-    pub async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn connect(&self) -> Result<(), Error> {
         use std::future::poll_fn;
 
         poll_fn(|cx| self.poll_connect(cx)).await
@@ -43,10 +44,7 @@ impl SslStream {
     /// Returns Poll::Pending if the operation would block and needs to be retried
     /// Returns Poll::Ready(Ok(())) if the handshake completed successfully
     /// Returns Poll::Ready(Err(_)) if there was an error
-    pub fn poll_connect(
-        &self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+    pub fn poll_connect(&self, cx: &mut Context<'_>) -> Poll<Result<(), crate::error::Error>> {
         loop {
             let handshake_result = unsafe { openssl_sys::SSL_connect(self.ssl.as_ptr()) };
 
@@ -67,7 +65,7 @@ impl SslStream {
                             guard.clear_ready();
                             continue; // Try SSL_connect again
                         }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Box::new(e))),
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::make_from_io(e))),
                         Poll::Pending => return Poll::Pending,
                     }
                 }
@@ -78,30 +76,27 @@ impl SslStream {
                             guard.clear_ready();
                             continue; // Try SSL_connect again
                         }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Box::new(e))),
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::make_from_io(e))),
                         Poll::Pending => return Poll::Pending,
                     }
                 }
                 _ => {
                     // Real error occurred
-                    return Poll::Ready(Err(Box::new(openssl::error::ErrorStack::get())));
+                    return Poll::Ready(Err(Error::make(handshake_result, &self.ssl)));
                 }
             }
         }
     }
 
     /// Async SSL accept
-    pub async fn accept(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn accept(&self) -> Result<(), Error> {
         use std::future::poll_fn;
 
         poll_fn(|cx| self.poll_accept(cx)).await
     }
 
     /// Poll-based accept for async compatibility
-    pub fn poll_accept(
-        &self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+    pub fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         loop {
             let handshake_result = unsafe { openssl_sys::SSL_accept(self.ssl.as_ptr()) };
 
@@ -119,7 +114,7 @@ impl SslStream {
                             guard.clear_ready();
                             continue; // Try SSL_accept again
                         }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Box::new(e))),
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::make_from_io(e))),
                         Poll::Pending => return Poll::Pending,
                     }
                 }
@@ -129,27 +124,24 @@ impl SslStream {
                             guard.clear_ready();
                             continue; // Try SSL_accept again
                         }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Box::new(e))),
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::make_from_io(e))),
                         Poll::Pending => return Poll::Pending,
                     }
                 }
-                _ => return Poll::Ready(Err(Box::new(openssl::error::ErrorStack::get()))),
+                _ => return Poll::Ready(Err(Error::make(handshake_result, &self.ssl))),
             }
         }
     }
 
     /// Async SSL shutdown
-    pub async fn ssl_shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn ssl_shutdown(&self) -> Result<(), Error> {
         use std::future::poll_fn;
 
         poll_fn(|cx| self.poll_ssl_shutdown(cx)).await
     }
 
     /// Poll-based shutdown for async compatibility
-    pub fn poll_ssl_shutdown(
-        &self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+    pub fn poll_ssl_shutdown(&self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         loop {
             let result = unsafe { openssl_sys::SSL_shutdown(self.ssl.as_ptr()) };
 
@@ -171,7 +163,7 @@ impl SslStream {
                             guard.clear_ready();
                             continue; // Try SSL_shutdown again
                         }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Box::new(e))),
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::make_from_io(e))),
                         Poll::Pending => return Poll::Pending,
                     }
                 }
@@ -181,11 +173,11 @@ impl SslStream {
                             guard.clear_ready();
                             continue; // Try SSL_shutdown again
                         }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Box::new(e))),
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::make_from_io(e))),
                         Poll::Pending => return Poll::Pending,
                     }
                 }
-                _ => return Poll::Ready(Err(Box::new(openssl::error::ErrorStack::get()))),
+                _ => return Poll::Ready(Err(Error::make(result, &self.ssl))),
             }
         }
     }
@@ -197,14 +189,14 @@ impl SslStream {
     pub fn ktls_send_enabled(&self) -> bool {
         unsafe {
             let wbio = openssl_sys::SSL_get_wbio(self.ssl.as_ptr());
-            crate::bio::ffi::BIO_get_ktls_send(wbio) != 0
+            crate::ffi::BIO_get_ktls_send(wbio) != 0
         }
     }
 
     pub fn ktls_recv_enabled(&self) -> bool {
         unsafe {
             let rbio = openssl_sys::SSL_get_rbio(self.ssl.as_ptr());
-            crate::bio::ffi::BIO_get_ktls_recv(rbio) != 0
+            crate::ffi::BIO_get_ktls_recv(rbio) != 0
         }
     }
 }
@@ -310,7 +302,10 @@ impl AsyncWrite for SslStream {
                                 Poll::Pending => return Poll::Pending,
                             }
                         }
-                        _ => return Poll::Ready(Err(std::io::Error::last_os_error())),
+                        _ => {
+                            let ssl_e = Error::make(len, &self.ssl);
+                            return Poll::Ready(Err(std::io::Error::other(ssl_e)));
+                        }
                     }
                 }
             }

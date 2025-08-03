@@ -1,21 +1,15 @@
 use std::os::fd::AsRawFd;
 
-use crate::bio::ffi::BIO_NOCLOSE;
 use foreign_types_shared::ForeignType;
+
+use crate::ffi::BIO_NOCLOSE;
 
 pub struct SslStream {
     _tcp: std::net::TcpStream,
     ssl: openssl::ssl::Ssl,
 }
 impl SslStream {
-    /// Create a new BIOSocketStream from a raw file descriptor and SSL object.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that:
-    /// - `fd` is a valid file descriptor
-    /// - The file descriptor remains valid for the lifetime of this object
-    /// - The SSL object is properly configured and compatible with socket operations
+    /// Create a new SslStream from a tcp stream and SSL object.
     pub fn new(tcp: std::net::TcpStream, ssl: openssl::ssl::Ssl) -> Self {
         let sock_bio = unsafe { openssl_sys::BIO_new_socket(tcp.as_raw_fd(), BIO_NOCLOSE) };
         assert!(!sock_bio.is_null(), "Failed to create socket BIO");
@@ -26,19 +20,19 @@ impl SslStream {
     }
 
     /// Synchronous connect method (kept for backward compatibility)
-    pub fn connect(&self) -> Result<(), openssl::error::ErrorStack> {
-        let handshake_result = unsafe { openssl_sys::SSL_connect(self.ssl.as_ptr()) };
-        if handshake_result <= 0 {
-            Err(openssl::error::ErrorStack::get())
+    pub fn connect(&self) -> Result<(), crate::error::Error> {
+        let result = unsafe { openssl_sys::SSL_connect(self.ssl.as_ptr()) };
+        if result <= 0 {
+            Err(crate::error::Error::make(result, self.ssl()))
         } else {
             Ok(())
         }
     }
 
-    pub fn accept(&self) -> Result<(), openssl::error::ErrorStack> {
-        let handshake_result = unsafe { openssl_sys::SSL_accept(self.ssl.as_ptr()) };
-        if handshake_result <= 0 {
-            Err(openssl::error::ErrorStack::get())
+    pub fn accept(&self) -> Result<(), crate::error::Error> {
+        let result = unsafe { openssl_sys::SSL_accept(self.ssl.as_ptr()) };
+        if result <= 0 {
+            Err(crate::error::Error::make(result, self.ssl()))
         } else {
             Ok(())
         }
@@ -48,10 +42,10 @@ impl SslStream {
         &self.ssl
     }
 
-    pub fn shutdown(&self) -> Result<(), openssl::error::ErrorStack> {
+    pub fn shutdown(&self) -> Result<(), crate::error::Error> {
         let result = unsafe { openssl_sys::SSL_shutdown(self.ssl.as_ptr()) };
         if result < 0 {
-            Err(openssl::error::ErrorStack::get())
+            Err(crate::error::Error::make(result, self.ssl()))
         } else {
             Ok(())
         }
@@ -60,14 +54,14 @@ impl SslStream {
     pub fn ktls_send_enabled(&self) -> bool {
         unsafe {
             let wbio = openssl_sys::SSL_get_wbio(self.ssl.as_ptr());
-            crate::bio::ffi::BIO_get_ktls_send(wbio) != 0
+            crate::ffi::BIO_get_ktls_send(wbio) != 0
         }
     }
 
     pub fn ktls_recv_enabled(&self) -> bool {
         unsafe {
             let rbio = openssl_sys::SSL_get_rbio(self.ssl.as_ptr());
-            crate::bio::ffi::BIO_get_ktls_recv(rbio) != 0
+            crate::ffi::BIO_get_ktls_recv(rbio) != 0
         }
     }
 }
@@ -81,7 +75,10 @@ impl std::io::Read for SslStream {
                 buf.len().try_into().unwrap(),
             );
             if len < 0 {
-                Err(std::io::Error::last_os_error())
+                Err(std::io::Error::other(crate::error::Error::make(
+                    len,
+                    self.ssl(),
+                )))
             } else {
                 Ok(len as usize)
             }
@@ -102,7 +99,10 @@ impl std::io::Write for SslStream {
                 buf.len().try_into().unwrap(),
             );
             if len < 0 {
-                Err(std::io::Error::last_os_error())
+                Err(std::io::Error::other(crate::error::Error::make(
+                    len,
+                    self.ssl(),
+                )))
             } else {
                 Ok(len as usize)
             }

@@ -32,7 +32,7 @@ jobs:
       run: cargo test --all -- --nocapture
 
     - name: Run llvm-cov
-      run: cargo llvm-cov --codecov --output-path codecov.json
+      run: cargo llvm-cov --codecov --output-path codecov.json --ignore-filename-regex openssl-ktls-tests.*
 
     - name: Show cov summary
-      run: cargo llvm-cov report --summary-only
+      run: cargo llvm-cov report --summary-only --ignore-filename-regex openssl-ktls-tests.*

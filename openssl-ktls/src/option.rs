@@ -3,7 +3,7 @@
 use openssl::ssl::SslOptions;
 
 pub const SSL_OP_ENABLE_KTLS: SslOptions =
-    SslOptions::from_bits_retain(crate::bio::ffi::SSL_OP_ENABLE_KTLS);
+    SslOptions::from_bits_retain(crate::ffi::SSL_OP_ENABLE_KTLS);
 
 // TLS 1.2 cipher suites for KTLS
 // AES-GCM ciphers
