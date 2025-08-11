@@ -1,6 +1,6 @@
 [package]
 name = "openssl-ktls"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 authors = ["youyuanwu@outlook.com"]
@@ -15,14 +15,14 @@ readme = "../README.md"
 openssl = { workspace = true, features = ["vendored"] , default-features = false}
 openssl-sys = { workspace = true, features = ["vendored"] , default-features = false}
 foreign-types-shared.workspace = true
-tokio = { workspace = true, features = ["net", "io-util"], optional = true}
+tokio = { workspace = true, features = ["net", "io-util"], default-features = false, optional = true}
 
 [features]
 default = ["tokio", "vendored"]
 # enable tokio support
 tokio = ["dep:tokio"]
 # use openssl built from source with ktls support
-vendored = ["openssl/vendored", "openssl-sys/vendored", "openssl-src/ktls"]
+vendored = ["openssl/vendored", "openssl-sys/vendored", "dep:openssl-src", "openssl-src/ktls"]
 
 [build-dependencies]
 openssl-src = { workspace = true, features = ["ktls"], default-features = false , optional = true}
