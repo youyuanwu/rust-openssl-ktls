@@ -10,6 +10,7 @@ use crate::ffi::BIO_NOCLOSE;
 use foreign_types_shared::ForeignType;
 
 /// Async version of SslStream that integrates with Tokio runtime
+#[derive(Debug)]
 pub struct SslStream {
     async_fd: AsyncFd<std::net::TcpStream>, // Use TcpStream as a wrapper for the raw fd
     ssl: openssl::ssl::Ssl,
@@ -31,6 +32,11 @@ impl SslStream {
         let async_fd = AsyncFd::new(std_tcp)?;
 
         Ok(SslStream { ssl, async_fd })
+    }
+
+    /// Get ref to the inner stream.
+    pub fn get_ref(&self) -> &std::net::TcpStream {
+        self.async_fd.get_ref()
     }
 
     /// Async SSL connect
@@ -222,7 +228,10 @@ impl AsyncRead for SslStream {
                 );
 
                 if len > 0 {
-                    buf.advance(len as usize);
+                    let bytes_read = len as usize;
+                    // FIXED: Initialize the bytes first, then advance
+                    buf.assume_init(bytes_read); // Mark bytes as initialized
+                    buf.advance(bytes_read); // Then advance the filled pointer
                     return Poll::Ready(Ok(()));
                 } else {
                     let ssl_error = openssl_sys::SSL_get_error(self.ssl.as_ptr(), len);
