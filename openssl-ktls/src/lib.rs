@@ -5,6 +5,10 @@
 //! The BIO blocks the ctrl messages that needs to be passed down to
 //! the next BIO layer.
 
+// Only support linux
+// Raw fd does not exist on windows.
+#![cfg(target_os = "linux")]
+
 pub mod ffi;
 
 pub mod option;
