@@ -4,7 +4,7 @@ members = [ "openssl-ktls", "openssl-ktls-tests"]
 
 [workspace.dependencies]
 foreign-types-shared = "0.1"
-tokio = { version = "1.40", features = ["full"] , default-features = false }
+tokio = { version = "1", features = ["full"] , default-features = false }
 openssl = { version = "0.10", default-features = false }
 openssl-sys = { version = "0.9", default-features = false }
 openssl-src = { version = "300", features = ["ktls"], default-features = false }
