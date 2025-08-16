@@ -129,7 +129,7 @@ async fn graceful_shutdown(stream: &mut openssl_ktls::TokioSslStream) {
 }
 
 const SERVER_BUFFER_SIZE: usize = 256;
-const CLIENT_PAYLOAD_SIZE: usize = 1024 * 16;
+const CLIENT_PAYLOAD_SIZE: usize = 1024 * 32;
 
 async fn echo_server(l: tokio::net::TcpListener, ssl_acpt: SslAcceptor, token: CancellationToken) {
     loop {
