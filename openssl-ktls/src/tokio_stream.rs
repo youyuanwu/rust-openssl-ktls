@@ -2,6 +2,7 @@ use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use openssl::ssl::ShutdownResult;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -14,6 +15,55 @@ use foreign_types_shared::ForeignType;
 pub struct SslStream {
     async_fd: AsyncFd<std::net::TcpStream>, // Use TcpStream as a wrapper for the raw fd
     ssl: openssl::ssl::Ssl,
+}
+
+enum ReactResult {
+    Final(Poll<Result<(), Error>>),
+    Retry,
+}
+
+fn react_to_ssl_call(
+    ssl_result: i32,
+    ssl: &openssl::ssl::Ssl,
+    async_fd: &AsyncFd<std::net::TcpStream>,
+    cx: &mut Context<'_>,
+) -> ReactResult {
+    // Check what kind of error occurred
+    let ssl_error = unsafe { openssl_sys::SSL_get_error(ssl.as_ptr(), ssl_result) };
+
+    match ssl_error {
+        openssl_sys::SSL_ERROR_WANT_READ => {
+            // SSL wants to read more data, wait for socket to become readable
+            match async_fd.poll_read_ready(cx) {
+                Poll::Ready(Ok(mut guard)) => {
+                    guard.clear_ready();
+                    ReactResult::Retry
+                }
+                Poll::Ready(Err(e)) => ReactResult::Final(Poll::Ready(Err(Error::from_io(e)))),
+                Poll::Pending => ReactResult::Final(Poll::Pending),
+            }
+        }
+        openssl_sys::SSL_ERROR_WANT_WRITE => {
+            // SSL wants to write more data, wait for socket to become writable
+            match async_fd.poll_write_ready(cx) {
+                Poll::Ready(Ok(mut guard)) => {
+                    guard.clear_ready();
+                    ReactResult::Retry
+                }
+                Poll::Ready(Err(e)) => ReactResult::Final(Poll::Ready(Err(Error::from_io(e)))),
+                Poll::Pending => ReactResult::Final(Poll::Pending),
+            }
+        }
+        openssl_sys::SSL_ERROR_ZERO_RETURN => {
+            // SSL connection closed cleanly
+            // TODO: maybe some api needs to react to this?
+            ReactResult::Final(Poll::Ready(Ok(())))
+        }
+        _ => {
+            // Real error occurred
+            ReactResult::Final(Poll::Ready(Err(Error::make(ssl_result, ssl))))
+        }
+    }
 }
 
 impl SslStream {
@@ -59,131 +109,69 @@ impl SslStream {
                 return Poll::Ready(Ok(()));
             }
 
-            // Check what kind of error occurred
-            let ssl_error =
-                unsafe { openssl_sys::SSL_get_error(self.ssl.as_ptr(), handshake_result) };
-
-            match ssl_error {
-                openssl_sys::SSL_ERROR_WANT_READ => {
-                    // SSL wants to read more data, wait for socket to become readable
-                    match self.async_fd.poll_read_ready(cx) {
-                        Poll::Ready(Ok(mut guard)) => {
-                            guard.clear_ready();
-                            continue; // Try SSL_connect again
-                        }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::make_from_io(e))),
-                        Poll::Pending => return Poll::Pending,
-                    }
-                }
-                openssl_sys::SSL_ERROR_WANT_WRITE => {
-                    // SSL wants to write more data, wait for socket to become writable
-                    match self.async_fd.poll_write_ready(cx) {
-                        Poll::Ready(Ok(mut guard)) => {
-                            guard.clear_ready();
-                            continue; // Try SSL_connect again
-                        }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::make_from_io(e))),
-                        Poll::Pending => return Poll::Pending,
-                    }
-                }
-                _ => {
-                    // Real error occurred
-                    return Poll::Ready(Err(Error::make(handshake_result, &self.ssl)));
-                }
+            match react_to_ssl_call(handshake_result, &self.ssl, &self.async_fd, cx) {
+                ReactResult::Final(result) => return result,
+                ReactResult::Retry => continue, // Retry the SSL_connect
             }
         }
     }
 
     /// Async SSL accept
-    pub async fn accept(&self) -> Result<(), Error> {
+    pub async fn accept(&mut self) -> Result<(), Error> {
         use std::future::poll_fn;
 
         poll_fn(|cx| self.poll_accept(cx)).await
     }
 
     /// Poll-based accept for async compatibility
-    pub fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+    pub fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         loop {
-            let handshake_result = unsafe { openssl_sys::SSL_accept(self.ssl.as_ptr()) };
+            let accept_result = unsafe { openssl_sys::SSL_accept(self.ssl.as_ptr()) };
 
-            if handshake_result > 0 {
+            if accept_result > 0 {
                 return Poll::Ready(Ok(()));
             }
-
-            let ssl_error =
-                unsafe { openssl_sys::SSL_get_error(self.ssl.as_ptr(), handshake_result) };
-
-            match ssl_error {
-                openssl_sys::SSL_ERROR_WANT_READ => {
-                    match self.async_fd.poll_read_ready(cx) {
-                        Poll::Ready(Ok(mut guard)) => {
-                            guard.clear_ready();
-                            continue; // Try SSL_accept again
-                        }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::make_from_io(e))),
-                        Poll::Pending => return Poll::Pending,
-                    }
-                }
-                openssl_sys::SSL_ERROR_WANT_WRITE => {
-                    match self.async_fd.poll_write_ready(cx) {
-                        Poll::Ready(Ok(mut guard)) => {
-                            guard.clear_ready();
-                            continue; // Try SSL_accept again
-                        }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::make_from_io(e))),
-                        Poll::Pending => return Poll::Pending,
-                    }
-                }
-                _ => return Poll::Ready(Err(Error::make(handshake_result, &self.ssl))),
+            match react_to_ssl_call(accept_result, &self.ssl, &self.async_fd, cx) {
+                ReactResult::Final(result) => return result,
+                ReactResult::Retry => continue, // Retry the SSL_accept
             }
         }
     }
 
     /// Async SSL shutdown
-    pub async fn ssl_shutdown(&self) -> Result<(), Error> {
+    pub async fn ssl_shutdown(&mut self) -> Result<openssl::ssl::ShutdownResult, Error> {
         use std::future::poll_fn;
 
         poll_fn(|cx| self.poll_ssl_shutdown(cx)).await
     }
 
     /// Poll-based shutdown for async compatibility
-    pub fn poll_ssl_shutdown(&self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+    pub fn poll_ssl_shutdown(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<openssl::ssl::ShutdownResult, Error>> {
         loop {
             let result = unsafe { openssl_sys::SSL_shutdown(self.ssl.as_ptr()) };
 
-            if result == 1 {
-                // Clean shutdown completed
-                return Poll::Ready(Ok(()));
-            } else if result == 0 {
-                // First phase of shutdown completed, need to wait for peer's close_notify
-                // For simplicity, we'll consider this complete
-                return Poll::Ready(Ok(()));
-            }
-
-            let ssl_error = unsafe { openssl_sys::SSL_get_error(self.ssl.as_ptr(), result) };
-
-            match ssl_error {
-                openssl_sys::SSL_ERROR_WANT_READ => {
-                    match self.async_fd.poll_read_ready(cx) {
-                        Poll::Ready(Ok(mut guard)) => {
-                            guard.clear_ready();
-                            continue; // Try SSL_shutdown again
+            match result {
+                1 => {
+                    // Clean shutdown completed
+                    return Poll::Ready(Ok(openssl::ssl::ShutdownResult::Received));
+                }
+                0 => {
+                    // First phase of shutdown completed, need to wait for peer's close_notify
+                    // For simplicity, we'll consider this complete
+                    return Poll::Ready(Ok(ShutdownResult::Sent));
+                }
+                i => {
+                    match react_to_ssl_call(i, &self.ssl, &self.async_fd, cx) {
+                        ReactResult::Final(result) => {
+                            return result
+                                .map(|res| res.map(|_| openssl::ssl::ShutdownResult::Sent));
                         }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::make_from_io(e))),
-                        Poll::Pending => return Poll::Pending,
+                        ReactResult::Retry => continue, // Retry the SSL_shutdown
                     }
                 }
-                openssl_sys::SSL_ERROR_WANT_WRITE => {
-                    match self.async_fd.poll_write_ready(cx) {
-                        Poll::Ready(Ok(mut guard)) => {
-                            guard.clear_ready();
-                            continue; // Try SSL_shutdown again
-                        }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::make_from_io(e))),
-                        Poll::Pending => return Poll::Pending,
-                    }
-                }
-                _ => return Poll::Ready(Err(Error::make(result, &self.ssl))),
             }
         }
     }
@@ -220,48 +208,32 @@ impl AsyncRead for SslStream {
         }
 
         loop {
+            let mut readbytes = 0;
             unsafe {
-                let len = openssl_sys::SSL_read(
+                let ret = openssl_sys::SSL_read_ex(
                     self.ssl.as_ptr(),
                     unfilled.as_mut_ptr() as *mut _,
-                    unfilled.len().try_into().unwrap_or(i32::MAX),
+                    unfilled.len(),
+                    &mut readbytes,
                 );
 
-                if len > 0 {
-                    let bytes_read = len as usize;
+                if ret > 0 {
                     // FIXED: Initialize the bytes first, then advance
-                    buf.assume_init(bytes_read); // Mark bytes as initialized
-                    buf.advance(bytes_read); // Then advance the filled pointer
+                    buf.assume_init(readbytes); // Mark bytes as initialized
+                    buf.advance(readbytes); // Then advance the filled pointer
                     return Poll::Ready(Ok(()));
-                } else {
-                    let ssl_error = openssl_sys::SSL_get_error(self.ssl.as_ptr(), len);
-                    match ssl_error {
-                        openssl_sys::SSL_ERROR_WANT_READ => {
-                            match self.async_fd.poll_read_ready(cx) {
-                                Poll::Ready(Ok(mut guard)) => {
-                                    guard.clear_ready();
-                                    continue; // Try SSL_read again
-                                }
-                                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                                Poll::Pending => return Poll::Pending,
-                            }
-                        }
-                        openssl_sys::SSL_ERROR_WANT_WRITE => {
-                            match self.async_fd.poll_write_ready(cx) {
-                                Poll::Ready(Ok(mut guard)) => {
-                                    guard.clear_ready();
-                                    continue; // Try SSL_read again
-                                }
-                                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                                Poll::Pending => return Poll::Pending,
-                            }
-                        }
-                        openssl_sys::SSL_ERROR_ZERO_RETURN => {
-                            // Clean shutdown
-                            return Poll::Ready(Ok(()));
-                        }
-                        _ => return Poll::Ready(Err(std::io::Error::last_os_error())),
+                }
+
+                match react_to_ssl_call(ret, &self.ssl, &self.async_fd, cx) {
+                    ReactResult::Final(result) => {
+                        return result.map(|res| {
+                            res.map_err(|arg0: Error| match arg0.into_io_error() {
+                                Ok(io_e) => io_e,
+                                Err(other) => std::io::Error::other(other),
+                            })
+                        });
                     }
+                    ReactResult::Retry => continue, // Retry the SSL_shutdown
                 }
             }
         }
@@ -289,32 +261,17 @@ impl AsyncWrite for SslStream {
                 if len > 0 {
                     return Poll::Ready(Ok(len as usize));
                 } else {
-                    let ssl_error = openssl_sys::SSL_get_error(self.ssl.as_ptr(), len);
-                    match ssl_error {
-                        openssl_sys::SSL_ERROR_WANT_READ => {
-                            match self.async_fd.poll_read_ready(cx) {
-                                Poll::Ready(Ok(mut guard)) => {
-                                    guard.clear_ready();
-                                    continue; // Try SSL_write again
-                                }
-                                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                                Poll::Pending => return Poll::Pending,
-                            }
+                    match react_to_ssl_call(len, &self.ssl, &self.async_fd, cx) {
+                        ReactResult::Final(result) => {
+                            return result.map(|res| {
+                                res.map_err(|arg0: Error| match arg0.into_io_error() {
+                                    Ok(io_e) => io_e,
+                                    Err(other) => std::io::Error::other(other),
+                                })
+                                .map(|_| 0)
+                            });
                         }
-                        openssl_sys::SSL_ERROR_WANT_WRITE => {
-                            match self.async_fd.poll_write_ready(cx) {
-                                Poll::Ready(Ok(mut guard)) => {
-                                    guard.clear_ready();
-                                    continue; // Try SSL_write again
-                                }
-                                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                                Poll::Pending => return Poll::Pending,
-                            }
-                        }
-                        _ => {
-                            let ssl_e = Error::make(len, &self.ssl);
-                            return Poll::Ready(Err(std::io::Error::other(ssl_e)));
-                        }
+                        ReactResult::Retry => continue, // Retry the SSL_write
                     }
                 }
             }
@@ -327,11 +284,11 @@ impl AsyncWrite for SslStream {
     }
 
     fn poll_shutdown(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
         match self.poll_ssl_shutdown(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
             Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::other(e))),
             Poll::Pending => Poll::Pending,
         }

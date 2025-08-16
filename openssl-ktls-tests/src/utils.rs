@@ -94,7 +94,7 @@ pub(crate) fn create_openssl_acceptor_builder(
     acceptor.set_verify_callback(openssl::ssl::SslVerifyMode::PEER, |ok, ctx| {
         if !ok {
             let e = ctx.error();
-            println!("verify failed : {e}");
+            println!("server verify callback failed : {e}");
         }
         ok
     });
@@ -113,10 +113,10 @@ pub(crate) fn create_openssl_connector_with_ktls(cert: &openssl::x509::X509) -> 
 
     connector.cert_store_mut().add_cert(cert.clone()).unwrap();
     connector.add_client_ca(cert).unwrap();
-    connector.set_verify_callback(openssl::ssl::SslVerifyMode::NONE, |ok, ctx| {
+    connector.set_verify_callback(openssl::ssl::SslVerifyMode::PEER, |ok, ctx| {
         if !ok {
             let e = ctx.error();
-            println!("verify failed : {e}");
+            println!("client verify callback failed : {e}");
         }
         ok
     });

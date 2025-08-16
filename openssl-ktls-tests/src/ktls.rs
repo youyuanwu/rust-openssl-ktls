@@ -91,6 +91,7 @@ fn ktls_test() {
             "data: {:?}",
             String::from_utf8_lossy(&data)
         );
+        ssl_s.shutdown().unwrap();
     }
 
     svr.join().unwrap();

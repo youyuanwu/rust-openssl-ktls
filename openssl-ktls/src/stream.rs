@@ -42,12 +42,19 @@ impl SslStream {
         &self.ssl
     }
 
-    pub fn shutdown(&self) -> Result<(), crate::error::Error> {
+    pub fn shutdown(&self) -> Result<openssl::ssl::ShutdownResult, crate::error::Error> {
         let result = unsafe { openssl_sys::SSL_shutdown(self.ssl.as_ptr()) };
-        if result < 0 {
-            Err(crate::error::Error::make(result, self.ssl()))
-        } else {
-            Ok(())
+        match result {
+            1 => {
+                // Clean shutdown completed
+                Ok(openssl::ssl::ShutdownResult::Received)
+            }
+            0 => {
+                // First phase of shutdown completed, need to wait for peer's close_notify
+                // For simplicity, we'll consider this complete
+                Ok(openssl::ssl::ShutdownResult::Sent)
+            }
+            i => Err(crate::error::Error::make(i, self.ssl())),
         }
     }
 
@@ -68,19 +75,21 @@ impl SslStream {
 
 impl std::io::Read for SslStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut bytes_read = 0;
         unsafe {
-            let len = openssl_sys::SSL_read(
+            let ret = openssl_sys::SSL_read_ex(
                 self.ssl.as_ptr(),
                 buf.as_mut_ptr() as *mut _,
-                buf.len().try_into().unwrap(),
+                buf.len(),
+                &mut bytes_read,
             );
-            if len < 0 {
+            if ret < 0 {
                 Err(std::io::Error::other(crate::error::Error::make(
-                    len,
+                    ret,
                     self.ssl(),
                 )))
             } else {
-                Ok(len as usize)
+                Ok(bytes_read)
             }
         }
     }

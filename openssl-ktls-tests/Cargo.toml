@@ -11,5 +11,10 @@ openssl-sys = { workspace = true, features = ["vendored"] , default-features = f
 openssl-ktls.workspace = true
 foreign-types-shared.workspace = true
 
+[dev-dependencies]
+tokio-util.workspace = true
+rand.workspace = true
+
+
 [build-dependencies]
 openssl-src = { workspace = true, features = ["ktls"], default-features = false }

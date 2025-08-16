@@ -69,7 +69,7 @@ impl Error {
         Error { code, cause }
     }
 
-    pub(crate) fn make_from_io(e: io::Error) -> Self {
+    pub fn from_io(e: io::Error) -> Self {
         Error {
             code: ErrorCode::SYSCALL,
             cause: Some(InnerError::Io(e)),

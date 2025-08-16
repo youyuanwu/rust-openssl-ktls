@@ -1,5 +1,8 @@
+use openssl::ssl::SslAcceptor;
 use openssl_ktls::option::SSL_OP_ENABLE_KTLS;
+use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
 use crate::utils::{HELLO, create_openssl_acceptor_builder, create_openssl_connector_with_ktls};
 
@@ -106,4 +109,184 @@ async fn async_ktls_test() {
     client_result.unwrap();
 
     println!("Async KTLS test completed successfully!");
+}
+
+async fn graceful_shutdown(stream: &mut openssl_ktls::TokioSslStream) {
+    // Perform a graceful shutdown
+    match stream.ssl_shutdown().await.unwrap() {
+        openssl::ssl::ShutdownResult::Sent => {
+            // wait for peer to receive
+            let received = stream.ssl_shutdown().await.unwrap();
+            assert_eq!(received, openssl::ssl::ShutdownResult::Received);
+        }
+        openssl::ssl::ShutdownResult::Received => {
+            // peer already shutdown.
+        }
+    }
+}
+
+async fn echo_server(l: tokio::net::TcpListener, ssl_acpt: SslAcceptor, token: CancellationToken) {
+    loop {
+        let stream = tokio::select! {
+            _ = token.cancelled() => {
+                println!("Echo server cancelled");
+                return;
+            }
+            stream = l.accept() => {
+                match stream {
+                    Ok((stream, _)) => stream,
+                    Err(e) => {
+                        eprintln!("Failed to accept TCP connection: {e}");
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let ssl_ctx = ssl_acpt.context();
+        let ssl = openssl::ssl::Ssl::new(ssl_ctx).unwrap();
+        let mut ssl_stream = openssl_ktls::TokioSslStream::new(stream, ssl).unwrap();
+
+        if let Err(e) = ssl_stream.accept().await {
+            eprintln!("Failed to accept SSL stream: {e}");
+            continue;
+        }
+
+        let mut buf = [0_u8; 1024];
+
+        // Read data from the client and echo it back
+        loop {
+            let n = ssl_stream.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break; // EOF
+            }
+            ssl_stream.write_all(&buf[..n]).await.unwrap();
+        }
+        graceful_shutdown(&mut ssl_stream).await;
+    }
+}
+
+async fn echo_client(
+    l_addr: std::net::SocketAddr,
+    ssl_con: &openssl::ssl::SslConnector,
+    payload: &[u8],
+    domain: &str,
+) -> Result<(), openssl_ktls::error::Error> {
+    let ssl = ssl_con.configure().unwrap().into_ssl(domain).unwrap();
+    let client = tokio::net::TcpStream::connect(l_addr).await.unwrap();
+    let mut ssl_stream = openssl_ktls::TokioSslStream::new(client, ssl).unwrap();
+
+    ssl_stream.connect().await?;
+
+    ssl_stream
+        .write_all(payload)
+        .await
+        .map_err(openssl_ktls::error::Error::from_io)?;
+    let mut buf = vec![0_u8; payload.len()];
+    let n = ssl_stream
+        .read_exact(&mut buf)
+        .await
+        .map_err(openssl_ktls::error::Error::from_io)?;
+    assert_eq!(n, payload.len());
+    assert_eq!(&buf[..n], payload);
+    graceful_shutdown(&mut ssl_stream).await;
+    Ok(())
+}
+
+async fn longhaul_client(l_addr: std::net::SocketAddr, ssl_con: &openssl::ssl::SslConnector) {
+    let ssl = ssl_con.configure().unwrap().into_ssl("localhost").unwrap();
+    let client = tokio::net::TcpStream::connect(l_addr).await.unwrap();
+    let ssl_stream = openssl_ktls::TokioSslStream::new(client, ssl).unwrap();
+
+    ssl_stream.connect().await.unwrap();
+
+    // generate random payload of random length
+    let mut rng = rand::rng();
+    let payload_len = rng.random_range(1..=4096);
+    let payload: Vec<u8> = (0..payload_len).map(|_| rng.random()).collect();
+
+    // make the payload into vec of chunks of random length
+    let mut chunks = Vec::new();
+    let mut offset = 0;
+    while offset < payload.len() {
+        let chunk_len = rng.random_range(1..=payload.len() - offset);
+        chunks.push(payload[offset..offset + chunk_len].to_vec());
+        offset += chunk_len;
+    }
+    assert_eq!(offset, payload.len());
+
+    // split the read and write stream using tokio
+    let (mut read_half, mut write_half) = tokio::io::split(ssl_stream);
+
+    let w_h = tokio::spawn(async move {
+        for chunk in chunks {
+            write_half.write_all(&chunk).await.unwrap();
+        }
+        write_half
+    });
+
+    // read the data back with random buf len.
+    let mut result_buf = Vec::new();
+    while result_buf.len() < payload.len() {
+        let rand_buf_len = rng.random_range(1..=1024);
+        let mut buf = vec![0_u8; rand_buf_len];
+        let n = read_half.read(&mut buf).await.unwrap();
+        if n == 0 {
+            break; // EOF
+        }
+        result_buf.extend_from_slice(&buf[..n]);
+    }
+    let write_half = w_h.await.unwrap();
+
+    // check the result is the same as payload
+    assert_eq!(result_buf, payload);
+
+    // Merge the streams back together
+    let mut ssl_stream = read_half.unsplit(write_half);
+
+    // Now you can use the reunited stream for additional operations
+    graceful_shutdown(&mut ssl_stream).await;
+}
+
+#[tokio::test]
+async fn echo_test() {
+    let l = tokio::net::TcpListener::bind("localhost:0").await.unwrap();
+    let (cert, key_pair) =
+        crate::utils::ssl_gen::mk_self_signed_cert(vec!["localhost".to_string()]).unwrap();
+    let ssl_acpt = create_openssl_acceptor_builder(&cert, &key_pair).build();
+
+    let l_addr = l.local_addr().unwrap();
+
+    let token = CancellationToken::new();
+
+    // Start the echo server
+    let h_svr = tokio::spawn(echo_server(l, ssl_acpt, token.clone()));
+
+    // Allow some time for the server to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let ssl_con = create_openssl_connector_with_ktls(&cert);
+
+    // Client test
+    {
+        echo_client(l_addr, &ssl_con, HELLO.as_bytes(), "localhost")
+            .await
+            .unwrap();
+    }
+    // Client test with bad hostname
+    {
+        let err = echo_client(l_addr, &ssl_con, b"dummy", "localhost_bad")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), openssl::ssl::ErrorCode::SSL);
+        assert_eq!(err.ssl_error().unwrap().errors().len(), 1); // bad hostname.
+    }
+
+    // run random test
+    {
+        longhaul_client(l_addr, &ssl_con).await;
+    }
+
+    token.cancel();
+    h_svr.await.unwrap();
 }
