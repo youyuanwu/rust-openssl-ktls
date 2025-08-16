@@ -201,6 +201,11 @@ async fn echo_client(
     Ok(())
 }
 
+fn generate_random_payload() -> Vec<u8> {
+    let mut rng = rand::rng();
+    (0..CLIENT_PAYLOAD_SIZE).map(|_| rng.random()).collect()
+}
+
 async fn longhaul_client(l_addr: std::net::SocketAddr, ssl_con: &openssl::ssl::SslConnector) {
     let ssl = ssl_con.configure().unwrap().into_ssl("localhost").unwrap();
     let client = tokio::net::TcpStream::connect(l_addr).await.unwrap();
@@ -210,9 +215,8 @@ async fn longhaul_client(l_addr: std::net::SocketAddr, ssl_con: &openssl::ssl::S
 
     // generate random payload of random length
     let (payload, send_chunks, receive_chunks_len) = {
+        let payload = generate_random_payload();
         let mut rng = rand::rng();
-        let payload: Vec<u8> = (0..CLIENT_PAYLOAD_SIZE).map(|_| rng.random()).collect();
-
         // make the payload into vec of chunks of random length
         let mut send_chunks = Vec::new();
         let mut offset = 0;
@@ -296,6 +300,13 @@ async fn echo_test() {
             .unwrap_err();
         assert_eq!(err.code(), openssl::ssl::ErrorCode::SSL);
         assert_eq!(err.ssl_error().unwrap().errors().len(), 1); // bad hostname.
+    }
+    // send big payload
+    {
+        let payload = generate_random_payload();
+        echo_client(l_addr, &ssl_con, &payload, "localhost")
+            .await
+            .unwrap();
     }
 
     // run random test
