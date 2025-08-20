@@ -1,7 +1,10 @@
 use openssl::ssl::SslAcceptor;
 use openssl_ktls::option::SSL_OP_ENABLE_KTLS;
 use rand::Rng;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    task::JoinSet,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::utils::{HELLO, create_openssl_acceptor_builder, create_openssl_connector_with_ktls};
@@ -125,6 +128,9 @@ async fn graceful_shutdown(stream: &mut openssl_ktls::TokioSslStream) {
     }
 }
 
+const SERVER_BUFFER_SIZE: usize = 256;
+const CLIENT_PAYLOAD_SIZE: usize = 1024 * 32;
+
 async fn echo_server(l: tokio::net::TcpListener, ssl_acpt: SslAcceptor, token: CancellationToken) {
     loop {
         let stream = tokio::select! {
@@ -142,27 +148,29 @@ async fn echo_server(l: tokio::net::TcpListener, ssl_acpt: SslAcceptor, token: C
                 }
             }
         };
-
         let ssl_ctx = ssl_acpt.context();
         let ssl = openssl::ssl::Ssl::new(ssl_ctx).unwrap();
-        let mut ssl_stream = openssl_ktls::TokioSslStream::new(stream, ssl).unwrap();
+        // process request in another task
+        tokio::spawn(async move {
+            let mut ssl_stream = openssl_ktls::TokioSslStream::new(stream, ssl).unwrap();
 
-        if let Err(e) = ssl_stream.accept().await {
-            eprintln!("Failed to accept SSL stream: {e}");
-            continue;
-        }
-
-        let mut buf = [0_u8; 1024];
-
-        // Read data from the client and echo it back
-        loop {
-            let n = ssl_stream.read(&mut buf).await.unwrap();
-            if n == 0 {
-                break; // EOF
+            if let Err(e) = ssl_stream.accept().await {
+                eprintln!("Failed to accept SSL stream: {e}");
+                return;
             }
-            ssl_stream.write_all(&buf[..n]).await.unwrap();
-        }
-        graceful_shutdown(&mut ssl_stream).await;
+
+            let mut buf = [0_u8; SERVER_BUFFER_SIZE];
+
+            // Read data from the client and echo it back
+            loop {
+                let n = ssl_stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break; // EOF
+                }
+                ssl_stream.write_all(&buf[..n]).await.unwrap();
+            }
+            graceful_shutdown(&mut ssl_stream).await;
+        });
     }
 }
 
@@ -193,6 +201,11 @@ async fn echo_client(
     Ok(())
 }
 
+fn generate_random_payload() -> Vec<u8> {
+    let mut rng = rand::rng();
+    (0..CLIENT_PAYLOAD_SIZE).map(|_| rng.random()).collect()
+}
+
 async fn longhaul_client(l_addr: std::net::SocketAddr, ssl_con: &openssl::ssl::SslConnector) {
     let ssl = ssl_con.configure().unwrap().into_ssl("localhost").unwrap();
     let client = tokio::net::TcpStream::connect(l_addr).await.unwrap();
@@ -201,25 +214,33 @@ async fn longhaul_client(l_addr: std::net::SocketAddr, ssl_con: &openssl::ssl::S
     ssl_stream.connect().await.unwrap();
 
     // generate random payload of random length
-    let mut rng = rand::rng();
-    let payload_len = rng.random_range(1..=4096);
-    let payload: Vec<u8> = (0..payload_len).map(|_| rng.random()).collect();
+    let (payload, send_chunks, receive_chunks_len) = {
+        let payload = generate_random_payload();
+        let mut rng = rand::rng();
+        // make the payload into vec of chunks of random length
+        let mut send_chunks = Vec::new();
+        let mut offset = 0;
+        while offset < payload.len() {
+            let chunk_len = rng.random_range(1..=payload.len() - offset);
+            send_chunks.push(payload[offset..offset + chunk_len].to_vec());
+            offset += chunk_len;
+        }
+        assert_eq!(offset, payload.len());
 
-    // make the payload into vec of chunks of random length
-    let mut chunks = Vec::new();
-    let mut offset = 0;
-    while offset < payload.len() {
-        let chunk_len = rng.random_range(1..=payload.len() - offset);
-        chunks.push(payload[offset..offset + chunk_len].to_vec());
-        offset += chunk_len;
-    }
-    assert_eq!(offset, payload.len());
+        // use receive chunk lengths the same as send chunk lengths.
+        let mut receive_chunks_len = send_chunks.iter().map(|c| c.len()).collect::<Vec<_>>();
+        use rand::prelude::SliceRandom;
+        receive_chunks_len.shuffle(&mut rng);
+        assert_eq!(payload.len(), receive_chunks_len.iter().sum::<usize>());
+
+        (payload, send_chunks, receive_chunks_len)
+    };
 
     // split the read and write stream using tokio
     let (mut read_half, mut write_half) = tokio::io::split(ssl_stream);
 
     let w_h = tokio::spawn(async move {
-        for chunk in chunks {
+        for chunk in send_chunks {
             write_half.write_all(&chunk).await.unwrap();
         }
         write_half
@@ -227,10 +248,9 @@ async fn longhaul_client(l_addr: std::net::SocketAddr, ssl_con: &openssl::ssl::S
 
     // read the data back with random buf len.
     let mut result_buf = Vec::new();
-    while result_buf.len() < payload.len() {
-        let rand_buf_len = rng.random_range(1..=1024);
-        let mut buf = vec![0_u8; rand_buf_len];
-        let n = read_half.read(&mut buf).await.unwrap();
+    for chunk_len in receive_chunks_len {
+        let mut buf = vec![0_u8; chunk_len];
+        let n = read_half.read_exact(&mut buf).await.unwrap();
         if n == 0 {
             break; // EOF
         }
@@ -281,11 +301,26 @@ async fn echo_test() {
         assert_eq!(err.code(), openssl::ssl::ErrorCode::SSL);
         assert_eq!(err.ssl_error().unwrap().errors().len(), 1); // bad hostname.
     }
+    // send big payload
+    {
+        let payload = generate_random_payload();
+        echo_client(l_addr, &ssl_con, &payload, "localhost")
+            .await
+            .unwrap();
+    }
 
     // run random test
-    {
-        longhaul_client(l_addr, &ssl_con).await;
+    let num_client = 10;
+    let mut set = JoinSet::new();
+    for _ in 0..num_client {
+        let ssl_con = ssl_con.clone();
+        set.spawn({
+            async move {
+                longhaul_client(l_addr, &ssl_con).await;
+            }
+        });
     }
+    set.join_all().await;
 
     token.cancel();
     h_svr.await.unwrap();

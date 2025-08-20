@@ -209,32 +209,32 @@ impl AsyncRead for SslStream {
 
         loop {
             let mut readbytes = 0;
-            unsafe {
-                let ret = openssl_sys::SSL_read_ex(
+            let ret = unsafe {
+                openssl_sys::SSL_read_ex(
                     self.ssl.as_ptr(),
                     unfilled.as_mut_ptr() as *mut _,
                     unfilled.len(),
                     &mut readbytes,
-                );
+                )
+            };
 
-                if ret > 0 {
-                    // FIXED: Initialize the bytes first, then advance
-                    buf.assume_init(readbytes); // Mark bytes as initialized
-                    buf.advance(readbytes); // Then advance the filled pointer
-                    return Poll::Ready(Ok(()));
-                }
+            if ret > 0 {
+                // FIXED: Initialize the bytes first, then advance
+                unsafe { buf.assume_init(readbytes) }; // Mark bytes as initialized
+                buf.advance(readbytes); // Then advance the filled pointer
+                return Poll::Ready(Ok(()));
+            }
 
-                match react_to_ssl_call(ret, &self.ssl, &self.async_fd, cx) {
-                    ReactResult::Final(result) => {
-                        return result.map(|res| {
-                            res.map_err(|arg0: Error| match arg0.into_io_error() {
-                                Ok(io_e) => io_e,
-                                Err(other) => std::io::Error::other(other),
-                            })
-                        });
-                    }
-                    ReactResult::Retry => continue, // Retry the SSL_shutdown
+            match react_to_ssl_call(ret, &self.ssl, &self.async_fd, cx) {
+                ReactResult::Final(result) => {
+                    return result.map(|res| {
+                        res.map_err(|arg0: Error| match arg0.into_io_error() {
+                            Ok(io_e) => io_e,
+                            Err(other) => std::io::Error::other(other),
+                        })
+                    });
                 }
+                ReactResult::Retry => continue, // Retry the SSL_shutdown
             }
         }
     }
@@ -251,28 +251,31 @@ impl AsyncWrite for SslStream {
         }
 
         loop {
-            unsafe {
-                let len = openssl_sys::SSL_write(
+            let mut written = 0;
+
+            let ret = unsafe {
+                openssl_sys::SSL_write_ex(
                     self.ssl.as_ptr(),
                     buf.as_ptr() as *const _,
-                    buf.len().try_into().unwrap_or(i32::MAX),
-                );
+                    buf.len(),
+                    &mut written,
+                )
+            };
 
-                if len > 0 {
-                    return Poll::Ready(Ok(len as usize));
-                } else {
-                    match react_to_ssl_call(len, &self.ssl, &self.async_fd, cx) {
-                        ReactResult::Final(result) => {
-                            return result.map(|res| {
-                                res.map_err(|arg0: Error| match arg0.into_io_error() {
-                                    Ok(io_e) => io_e,
-                                    Err(other) => std::io::Error::other(other),
-                                })
-                                .map(|_| 0)
-                            });
-                        }
-                        ReactResult::Retry => continue, // Retry the SSL_write
+            if ret > 0 {
+                return Poll::Ready(Ok(written));
+            } else {
+                match react_to_ssl_call(ret, &self.ssl, &self.async_fd, cx) {
+                    ReactResult::Final(result) => {
+                        return result.map(|res| {
+                            res.map_err(|arg0: Error| match arg0.into_io_error() {
+                                Ok(io_e) => io_e,
+                                Err(other) => std::io::Error::other(other),
+                            })
+                            .map(|_| 0)
+                        });
                     }
+                    ReactResult::Retry => continue, // Retry the SSL_write
                 }
             }
         }
