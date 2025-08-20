@@ -2,24 +2,35 @@ use std::io::{Read, Write};
 
 use openssl_ktls::option::SSL_OP_ENABLE_KTLS;
 
-use crate::utils::{HELLO, create_openssl_acceptor_builder, create_openssl_connector_with_ktls};
+use crate::{
+    SSL_TEST_SEMAPHORE,
+    utils::{HELLO, TestMode, create_openssl_acceptor_builder, create_openssl_connector_with_ktls},
+};
 
 #[test]
 fn ktls_test() {
+    let _guard = loop {
+        if let Ok(permit) = SSL_TEST_SEMAPHORE.try_acquire() {
+            break permit;
+        } else {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    };
+
     let l = std::net::TcpListener::bind("localhost:0").unwrap();
     let l_addr = l.local_addr().unwrap();
 
     let (cert, key_pair) =
         crate::utils::ssl_gen::mk_self_signed_cert(vec!["localhost".to_string()]).unwrap();
 
-    let mut ssl_acpt_builder = create_openssl_acceptor_builder(&cert, &key_pair);
+    let mut ssl_acpt_builder = create_openssl_acceptor_builder(&cert, &key_pair, TestMode::Ktls);
 
     // Set ktls and KTLS-compatible ciphers for TLS 1.2
     ssl_acpt_builder.set_options(SSL_OP_ENABLE_KTLS);
 
     let ssl_acpt = ssl_acpt_builder.build();
 
-    let ssl_con = create_openssl_connector_with_ktls(&cert)
+    let ssl_con = create_openssl_connector_with_ktls(&cert, TestMode::Ktls)
         .configure()
         .unwrap();
 

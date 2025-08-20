@@ -10,6 +10,8 @@ use openssl_sys::{
     BIO_set_init,
 };
 
+pub mod custom_engine;
+pub mod custom_provider;
 pub mod ffi;
 
 pub trait Bio {

@@ -1,9 +1,12 @@
 // Safe configuration for KTLS
 
-use openssl::ssl::SslOptions;
+use openssl::ssl::{SslMode, SslOptions};
 
 pub const SSL_OP_ENABLE_KTLS: SslOptions =
     SslOptions::from_bits_retain(crate::ffi::SSL_OP_ENABLE_KTLS);
+
+// Support Asynchronous operation
+pub const SSL_MODE_ASYNC: SslMode = SslMode::from_bits_retain(crate::ffi::SSL_MODE_ASYNC);
 
 // TLS 1.2 cipher suites for KTLS
 // AES-GCM ciphers

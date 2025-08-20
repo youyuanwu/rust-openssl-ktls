@@ -20,4 +20,5 @@ pub mod tokio_stream;
 #[cfg(feature = "tokio")]
 pub type TokioSslStream = tokio_stream::SslStream;
 
+pub mod async_mode;
 pub mod error;

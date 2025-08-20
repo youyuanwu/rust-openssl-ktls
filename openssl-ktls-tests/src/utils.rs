@@ -77,9 +77,17 @@ pub mod ssl_gen {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum TestMode {
+    None,  // no feature enabled
+    Ktls,  // ktls enabled
+    Async, // async enabled
+}
+
 pub(crate) fn create_openssl_acceptor_builder(
     cert: &openssl::x509::X509,
     key: &openssl::pkey::PKey<openssl::pkey::Private>,
+    test_mode: TestMode,
 ) -> openssl::ssl::SslAcceptorBuilder {
     let mut acceptor =
         openssl::ssl::SslAcceptor::mozilla_intermediate(openssl::ssl::SslMethod::tls()).unwrap();
@@ -98,18 +106,26 @@ pub(crate) fn create_openssl_acceptor_builder(
         }
         ok
     });
+
+    match test_mode {
+        TestMode::None => {}
+        TestMode::Ktls => {
+            acceptor.set_options(openssl_ktls::option::SSL_OP_ENABLE_KTLS);
+        }
+        TestMode::Async => {
+            acceptor.set_mode(openssl_ktls::option::SSL_MODE_ASYNC);
+        }
+    }
+
     acceptor
 }
 
-pub(crate) fn create_openssl_connector_with_ktls(cert: &openssl::x509::X509) -> SslConnector {
+pub(crate) fn create_openssl_connector_with_ktls(
+    cert: &openssl::x509::X509,
+    test_mode: TestMode,
+) -> SslConnector {
     let mut connector =
         openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls()).unwrap();
-
-    connector.set_options(openssl_ktls::option::SSL_OP_ENABLE_KTLS);
-    // ktls requires a cipher that supports it
-    connector
-        .set_cipher_list(openssl_ktls::option::ECDHE_RSA_AES128_GCM_SHA256)
-        .unwrap();
 
     connector.cert_store_mut().add_cert(cert.clone()).unwrap();
     connector.add_client_ca(cert).unwrap();
@@ -123,5 +139,19 @@ pub(crate) fn create_openssl_connector_with_ktls(cert: &openssl::x509::X509) -> 
     connector
         .set_min_proto_version(Some(SslVersion::TLS1_2))
         .unwrap();
+    match test_mode {
+        TestMode::None => {}
+        TestMode::Ktls => {
+            connector.set_options(openssl_ktls::option::SSL_OP_ENABLE_KTLS);
+            // ktls requires a cipher that supports it
+            connector
+                .set_cipher_list(openssl_ktls::option::ECDHE_RSA_AES128_GCM_SHA256)
+                .unwrap();
+        }
+        TestMode::Async => {
+            connector.set_mode(openssl_ktls::option::SSL_MODE_ASYNC);
+        }
+    }
+
     connector.build()
 }
