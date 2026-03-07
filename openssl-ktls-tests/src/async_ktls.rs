@@ -1,6 +1,6 @@
 use openssl::ssl::SslAcceptor;
 use openssl_ktls::option::SSL_OP_ENABLE_KTLS;
-use rand::Rng;
+use rand::RngExt;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     task::JoinSet,
