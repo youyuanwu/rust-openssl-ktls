@@ -1,14 +1,31 @@
 name: build
 
-on: [push, pull_request]
+on: [push, pull_request, workflow_dispatch]
+
+env:
+  RUST_MSRV: "1.90.0"
 
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      rust-msrv: ${{ env.RUST_MSRV }}
+      rust-version: ${{ steps.parse.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: parse
+        run: |
+          version=$(grep 'channel' rust-toolchain.toml | sed 's/.*"\(.*\)"/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: setup
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ ubuntu-latest ]
-        rust: [ 1.90.0, 1.94.0 ]
+        rust: [ '${{ needs.setup.outputs.rust-msrv }}', '${{ needs.setup.outputs.rust-version }}' ]
     steps:
     - uses: actions/checkout@v4
 
@@ -21,19 +38,19 @@ jobs:
     - uses: taiki-e/install-action@cargo-llvm-cov
 
     - name: Run cargo check
-      run: cargo +${{ matrix.rust }} check
+      run: cargo +${{ matrix.rust }} check --locked
 
     - name: Run cargo fmt
       run: cargo +${{ matrix.rust }} fmt --all -- --check
-    
+
     - name: Run cargo clippy
-      run: cargo +${{ matrix.rust }} clippy --all-targets -- -D warnings
-    
+      run: cargo +${{ matrix.rust }} clippy --locked --all-targets -- -D warnings
+
     - name: Run cargo test
-      run: cargo +${{ matrix.rust }} test --all -- --nocapture
+      run: cargo +${{ matrix.rust }} test --locked --all -- --nocapture
 
     - name: Run llvm-cov
-      run: cargo +${{ matrix.rust }} llvm-cov --codecov --output-path codecov.json --ignore-filename-regex openssl-ktls-tests.*
+      run: cargo +${{ matrix.rust }} llvm-cov --locked --codecov --output-path codecov.json --ignore-filename-regex openssl-ktls-tests.*
 
     - name: Show cov summary
       run: cargo +${{ matrix.rust }} llvm-cov report --summary-only --ignore-filename-regex openssl-ktls-tests.*
