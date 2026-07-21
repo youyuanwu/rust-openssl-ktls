@@ -7,7 +7,7 @@ foreign-types-shared = "0.1"
 tokio = { version = "1", features = ["full"] , default-features = false }
 openssl = { version = "0.10", default-features = false }
 openssl-sys = { version = "0.9", default-features = false }
-openssl-src = { version = "300", features = ["ktls"], default-features = false }
+openssl-src = { version = "400", features = ["ktls"], default-features = false }
 
 # dev deps
 tokio-util = "0.7"
