@@ -75,6 +75,72 @@ What the data does and does not support:
    any BIO indirection cost — but "overlap" is a statement about this noise floor, not a
    proof of equality.
 
+## Why buffering helps
+
+The obvious explanation — "fewer syscalls, so less syscall entry overhead" — does not
+survive arithmetic. At 8 MiB the unbuffered variants run at ~590 MiB/s and the buffered one
+at ~1400 MiB/s, which per 16 KiB record is:
+
+| | per record | |
+|---|---|---|
+| unbuffered | 26.5 us | |
+| buffered | 11.2 us | |
+| **difference** | **15.3 us** | ~20x too large to be syscall entry cost (~1 us) |
+
+Instrumenting an 8 MiB transfer (512 records) shows where it actually goes:
+
+| | context switches | loopback packets | packet size | throughput |
+|---|---|---|---|---|
+| unbuffered | 390 (**0.76/record**) | 771 | 10.6 KiB | 406 MiB/s |
+| buffered | 18 (0.04/record) | 188 | 43.6 KiB | 1241 MiB/s |
+
+**Roughly one context switch per TLS record.** A cross-core wakeup costs ~5-15 us, which
+closes the 15.3 us gap. Two effects compound:
+
+1. **Wakeup amplification.** With `TCP_NODELAY` every 16 KiB write pushes immediately and
+   wakes the reader. The writer then fills the send buffer, gets `EWOULDBLOCK`, registers
+   with epoll and yields. Each record therefore costs a write plus a push plus a reader
+   wakeup plus a writer reschedule — not one syscall. Batching amortises all of it.
+2. **Packet count.** Larger writes let the stack build bigger GSO super-packets, 10.6 KiB
+   to 43.6 KiB here, so ~4x fewer traversals of the TCP and loopback receive path. That
+   cost lands in softirq rather than in your syscall.
+
+### What actually changes size
+
+Only the syscall does. Three sizes are easy to conflate:
+
+| Layer | Unbuffered | Buffered |
+|---|---|---|
+| TLS record — what OpenSSL emits per `BIO_write` | 16 KiB | 16 KiB, unchanged |
+| `write(2)` | 16 KiB | **1 MiB** |
+| TCP segment on the wire | 10.6 KiB | 43.6 KiB |
+
+With a `BufWriter` interposed, `BIO_write` still fires once per record, but it lands on
+`BufWriter::poll_write`, which is a memcpy into the userspace buffer and **not** a syscall.
+Only when that buffer fills, or on `flush`, does a single `write(2)` carrying ~64 records
+reach the kernel. This is what `write_counts.rs` measures — the counting wrapper sits below
+the `BufWriter`, so it counts real syscalls: 64 unbuffered versus 2 buffered per MiB.
+
+The TLS protocol is untouched. Records are still <=16 KiB on the wire — that is a format
+limit, not a tunable — and the receiver sees a byte-identical stream. Buffering changes only
+how many syscalls carry those bytes.
+
+The cost is one extra memcpy per record, which is why the benefit is size-dependent: worth
+it by 2.4x at 1-8 MiB, and pure overhead at 1 KiB and 16 KiB where there is nothing to
+batch. Note also that `TCP_NODELAY` inflates the effect by forcing a push per record; with
+Nagle enabled the gap would narrow, though not much at 16 KiB since Nagle does not hold back
+segments larger than the MSS.
+
+### Reproducing the instrumentation
+
+The context-switch and packet counts above came from one-off instrumentation rather than a
+committed test. To repeat it, sample around the transfer:
+
+- context switches: sum `voluntary_ctxt_switches` + `nonvoluntary_ctxt_switches` across
+  `/proc/self/task/*/status` (the per-process `/proc/self/status` only covers the main
+  thread, and the work happens on tokio workers)
+- packets: the `lo:` receive-packet column of `/proc/net/dev`
+
 ### Implication for a vectored BIO
 
 A queuing/`writev` BIO cannot beat the `BufWriter` numbers above, because the win comes
@@ -82,6 +148,11 @@ from issuing fewer syscalls rather than from scatter-gather. It would also have 
 each record into its own buffer — OpenSSL recycles `wbuf` as soon as `BIO_write` returns —
 so it buys the same syscall reduction at the same copy cost, with far more unsafe code.
 A vectored BIO would also disable KTLS, since `BIO_get_ktls_send` requires a real socket BIO.
+
+For contrast, rustls avoids that extra copy because it is sans-I/O: it encrypts directly
+into owned chunks in a `VecDeque<Vec<u8>>` that stay alive until the caller drains them, so
+`write_tls` can build `IoSlice`s over them and issue one `write_vectored`. OpenSSL cannot,
+because its record layer owns the I/O loop and must recycle its write buffer per record.
 
 ## Methodology
 
