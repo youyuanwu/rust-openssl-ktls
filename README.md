@@ -9,12 +9,20 @@ Use openssl with [kernel TLS offload](https://www.kernel.org/doc/html/latest/net
 This crate implements sync SslStream and async tokio SslStream that are ktls capable, extending the [openssl](https://crates.io/crates/openssl) crate.
 
 ## Get started
+This crate links against the system openssl, which is expected to be built with
+kernel TLS support (`enable-ktls`). Most modern distros (e.g. OpenSSL 3.x on
+recent Ubuntu/Debian) ship openssl with ktls enabled.
+
 Add to Cargo.toml
 ```toml
-openssl-ktls = { version = "*", default-features = false, features = ["tokio", "vendored"]}
+openssl-ktls = { version = "*", default-features = false, features = ["tokio"]}
 ```
 * feature `tokio` enables tokio based async SslStream.
-* feature `vendored` enableds build openssl from source with ktls enabled. If your system openssl is already built with ktls enabled, you can skip this feature.
+
+The kernel `tls` module also needs to be loaded at runtime:
+```sh
+sudo modprobe tls
+```
 
 ## Examples
 SslStream works the same way as `openssl::ssl::SslStream`.

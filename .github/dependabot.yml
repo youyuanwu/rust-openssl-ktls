@@ -6,7 +6,6 @@ updates:
       interval: "weekly"
     ignore:
       - dependency-name: "foreign-types-shared"
-      - dependency-name: "openssl-src"
     groups:
       cargo-all:
         patterns:

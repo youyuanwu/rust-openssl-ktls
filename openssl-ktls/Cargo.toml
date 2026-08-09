@@ -18,11 +18,6 @@ foreign-types-shared.workspace = true
 tokio = { workspace = true, features = ["net", "io-util"], default-features = false, optional = true}
 
 [features]
-default = ["tokio", "vendored"]
+default = ["tokio"]
 # enable tokio support
 tokio = ["dep:tokio"]
-# use openssl built from source with ktls support
-vendored = ["openssl/vendored", "openssl-sys/vendored", "dep:openssl-src", "openssl-src/ktls"]
-
-[build-dependencies]
-openssl-src = { workspace = true, features = ["ktls"], default-features = false , optional = true}
