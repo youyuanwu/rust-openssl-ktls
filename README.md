@@ -43,7 +43,9 @@ let send_enabled = ssl_s.ktls_send_enabled();
 
 # Benchmarks
 Write-path benchmarks live in `openssl-ktls-tests/benches/`. See [docs/Benchmarks.md](docs/Benchmarks.md)
-for how to run them and what they show about TLS record size, syscall counts, and KTLS.
+for how to run them and what they show about TLS record size, syscall counts, and KTLS,
+and [docs/ZeroCopy.md](docs/ZeroCopy.md) for which copies on the write path can be removed
+and why.
 
 # License
 This project is licensed under the MIT license.
