@@ -385,9 +385,18 @@ mod tests {
             }
         }
 
-        /// Drain `from`'s outbound ciphertext into `queue`, then feed as much of
-        /// `queue` as `to` will accept, retaining any remainder.
-        fn pump(from: &mut TlsEngine, to: &mut TlsEngine, queue: &mut Vec<u8>) {
+        /// Drain `from`'s outbound ciphertext into `queue`, then feed at most
+        /// `max_feed` bytes of `queue` to `to`, retaining any remainder.
+        ///
+        /// `max_feed` exists so tests can deliver a record a few bytes at a
+        /// time, which is what a real transport does and which the engine must
+        /// tolerate without reporting a premature end of stream.
+        fn pump_limited(
+            from: &mut TlsEngine,
+            to: &mut TlsEngine,
+            queue: &mut Vec<u8>,
+            max_feed: usize,
+        ) {
             let mut buf = vec![0u8; 8192];
             while from.outbound_pending() > 0 {
                 let n = from.take_outbound(&mut buf);
@@ -397,15 +406,22 @@ mod tests {
                 queue.extend_from_slice(&buf[..n]);
             }
 
+            let limit = queue.len().min(max_feed);
             let mut off = 0;
-            while off < queue.len() {
-                let accepted = to.put_inbound(&queue[off..]);
+            while off < limit {
+                let accepted = to.put_inbound(&queue[off..limit]);
                 if accepted == 0 {
                     break; // receiver is full; keep the rest for next round
                 }
                 off += accepted;
             }
             queue.drain(..off);
+        }
+
+        /// Drain `from`'s outbound ciphertext into `queue`, then feed as much of
+        /// `queue` as `to` will accept, retaining any remainder.
+        fn pump(from: &mut TlsEngine, to: &mut TlsEngine, queue: &mut Vec<u8>) {
+            Self::pump_limited(from, to, queue, usize::MAX);
         }
 
         fn client_to_server_bytes(&mut self) {
@@ -432,6 +448,17 @@ mod tests {
 
         /// Write all of `data` from client to server and return what arrived.
         fn client_to_server(&mut self, data: &[u8]) -> Vec<u8> {
+            self.transfer(data, Direction::ClientToServer, usize::MAX)
+        }
+
+        /// Write all of `data` from server to client and return what arrived.
+        fn server_to_client(&mut self, data: &[u8]) -> Vec<u8> {
+            self.transfer(data, Direction::ServerToClient, usize::MAX)
+        }
+
+        /// Move `data` in `dir`, delivering at most `max_feed` ciphertext bytes
+        /// per round so tests can simulate fragmented delivery.
+        fn transfer(&mut self, data: &[u8], dir: Direction, max_feed: usize) -> Vec<u8> {
             let mut sent = 0;
             let mut received = Vec::new();
             let mut rbuf = vec![0u8; 8192];
@@ -439,25 +466,54 @@ mod tests {
             let mut guard = 0;
             while sent < data.len() || received.len() < data.len() {
                 guard += 1;
-                assert!(guard < 100_000, "transfer failed to converge");
+                assert!(guard < 1_000_000, "transfer failed to converge");
+
+                let (writer, reader) = match dir {
+                    Direction::ClientToServer => (&mut self.client, &mut self.server),
+                    Direction::ServerToClient => (&mut self.server, &mut self.client),
+                };
 
                 if sent < data.len() {
-                    match self.client.write_plaintext(&data[sent..]).unwrap() {
+                    match writer.write_plaintext(&data[sent..]).unwrap() {
                         Progress::Done(n) => sent += n,
                         Progress::NeedsFlush | Progress::NeedsInbound => {}
                     }
                 }
-                self.client_to_server_bytes();
-
-                if let Progress::Done(n) = self.server.read_plaintext(&mut rbuf).unwrap()
+                if let Progress::Done(n) = reader.read_plaintext(&mut rbuf).unwrap()
                     && n > 0
                 {
                     received.extend_from_slice(&rbuf[..n]);
                 }
-                self.server_to_client_bytes();
+
+                match dir {
+                    Direction::ClientToServer => {
+                        Self::pump_limited(
+                            &mut self.client,
+                            &mut self.server,
+                            &mut self.c2s,
+                            max_feed,
+                        );
+                        Self::pump(&mut self.server, &mut self.client, &mut self.s2c);
+                    }
+                    Direction::ServerToClient => {
+                        Self::pump_limited(
+                            &mut self.server,
+                            &mut self.client,
+                            &mut self.s2c,
+                            max_feed,
+                        );
+                        Self::pump(&mut self.client, &mut self.server, &mut self.c2s);
+                    }
+                }
             }
             received
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Direction {
+        ClientToServer,
+        ServerToClient,
     }
 
     #[test]
@@ -485,6 +541,104 @@ mod tests {
         // cannot complete without repeated draining.
         let msg: Vec<u8> = (0..250_000u32).map(|i| (i % 251) as u8).collect();
         assert_eq!(p.client_to_server(&msg), msg);
+    }
+
+    #[test]
+    fn round_trips_server_to_client() {
+        let mut p = Pair::new();
+        p.handshake();
+        let msg: Vec<u8> = (0..60_000u32).map(|i| (i % 97) as u8).collect();
+        assert_eq!(p.server_to_client(&msg), msg);
+    }
+
+    /// A real transport delivers records in arbitrary fragments. The engine
+    /// must accumulate until a whole record is available rather than reporting
+    /// a premature end of stream.
+    #[test]
+    fn tolerates_ciphertext_delivered_in_tiny_fragments() {
+        let mut p = Pair::new();
+        p.handshake();
+
+        let msg: Vec<u8> = (0..20_000u32).map(|i| (i % 233) as u8).collect();
+        // 7 bytes per round is far smaller than any TLS record header+body.
+        let got = p.transfer(&msg, Direction::ClientToServer, 7);
+        assert_eq!(got, msg);
+    }
+
+    /// Corrupt ciphertext must surface as a TLS protocol error, distinct from
+    /// a transport problem or a truncation.
+    #[test]
+    fn corrupt_ciphertext_is_a_tls_error() {
+        let mut p = Pair::new();
+        p.handshake();
+
+        // Produce a genuine record, then flip bits in its body so the MAC fails.
+        assert!(matches!(
+            p.client.write_plaintext(b"payload").unwrap(),
+            Progress::Done(_)
+        ));
+        let mut buf = vec![0u8; 8192];
+        let n = p.client.take_outbound(&mut buf);
+        assert!(n > 0, "expected a record on the wire");
+        for b in buf[n / 2..n].iter_mut() {
+            *b ^= 0xFF;
+        }
+        assert_eq!(p.server.put_inbound(&buf[..n]), n);
+
+        let mut out = [0u8; 64];
+        match p.server.read_plaintext(&mut out) {
+            Err(Error::Tls(_)) => {}
+            other => panic!("expected Tls, got {other:?}"),
+        }
+    }
+
+    /// When the peer stops draining, `SSL_write_ex` cannot make progress and
+    /// OpenSSL demands the retry present the identical buffer. This exercises
+    /// that path end to end: stall, observe the retry obligation, drain, and
+    /// then complete with the same bytes.
+    #[test]
+    fn stalled_write_owes_an_identical_retry_and_then_succeeds() {
+        let mut p = Pair::new();
+        p.handshake();
+
+        // Never drain the client's outbound side, so the pair fills up.
+        let data = vec![0x3Cu8; MAX_RECORD];
+        let mut stalled = None;
+        for _ in 0..64 {
+            match p.client.write_plaintext(&data).unwrap() {
+                Progress::Done(_) => continue,
+                other => {
+                    stalled = Some(other);
+                    break;
+                }
+            }
+        }
+        let stalled = stalled.expect("writing without draining should eventually stall");
+        assert_eq!(
+            stalled,
+            Progress::NeedsFlush,
+            "a full pair must ask to flush, never to read"
+        );
+        assert!(
+            p.client.retry_owed(),
+            "OpenSSL saw the buffer, so an identical retry is owed"
+        );
+
+        // Drain to the peer, then retry with the very same bytes.
+        p.client_to_server_bytes();
+        let mut sink = vec![0u8; 8192];
+        while let Progress::Done(n) = p.server.read_plaintext(&mut sink).unwrap() {
+            if n == 0 {
+                break;
+            }
+            p.client_to_server_bytes();
+        }
+
+        match p.client.write_plaintext(&data).unwrap() {
+            Progress::Done(n) => assert!(n > 0, "retry should make progress"),
+            other => panic!("expected progress after draining, got {other:?}"),
+        }
+        assert!(!p.client.retry_owed(), "retry obligation should be cleared");
     }
 
     /// A single `SSL_write_ex` never takes more than one record, so oversized

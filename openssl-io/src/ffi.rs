@@ -120,6 +120,21 @@ impl BioPair {
         // SAFETY: `app_side` is a live BIO.
         unsafe { BIO_test_flags(self.app_side, openssl_sys::BIO_FLAGS_SHOULD_RETRY) != 0 }
     }
+
+    /// Write into the SSL-side half. Test-only: in production that half belongs
+    /// to OpenSSL, but tests need to drive both ends to verify the plumbing.
+    #[cfg(test)]
+    fn write_ssl_side(&self, data: &[u8]) -> usize {
+        if data.is_empty() || self.ssl_side.is_null() {
+            return 0;
+        }
+        let len = data.len().min(c_int::MAX as usize) as c_int;
+        // SAFETY: `data` is valid for `len` bytes, and `ssl_side` is live
+        // because tests never hand it to `SSL_set_bio`.
+        let n =
+            unsafe { openssl_sys::BIO_write(self.ssl_side, data.as_ptr() as *const c_void, len) };
+        if n <= 0 { 0 } else { n as usize }
+    }
 }
 
 impl Drop for BioPair {
@@ -168,32 +183,68 @@ mod tests {
         assert!(pair.should_retry());
     }
 
-    /// Cross-checks the hardcoded `BIO_CTRL_PENDING` value against a known
-    /// write size. If the constant were wrong this would report nonsense.
+    /// Cross-checks the hardcoded ctrl constants against known byte counts by
+    /// driving both halves. If either constant were wrong, these would report
+    /// nonsense rather than the exact sizes written.
     #[test]
-    fn pending_reports_exact_written_count() {
+    fn pending_and_wpending_report_exact_counts() {
         let pair = BioPair::new(BUF).unwrap();
         assert_eq!(pair.pending(), 0);
+        assert_eq!(pair.write_pending(), 0);
 
-        let data = vec![0x11u8; 100];
-        assert_eq!(pair.write(&data), 100);
-        // Written into *our* half, so it is pending for the peer, not for us.
+        // Bytes we write are buffered *for the peer*, so they show up as
+        // write-pending on our side and readable on theirs.
+        assert_eq!(pair.write(&[0x11u8; 100]), 100);
         assert_eq!(pair.write_pending(), 100);
         assert_eq!(pair.pending(), 0);
+
+        // Bytes the SSL side writes become readable on our side.
+        assert_eq!(pair.write_ssl_side(&[0x22u8; 250]), 250);
+        assert_eq!(pair.pending(), 250);
     }
 
     #[test]
     fn draining_frees_capacity_for_further_writes() {
         let pair = BioPair::new(BUF).unwrap();
 
-        let data = vec![0xCDu8; BUF];
-        assert_eq!(pair.write(&data), BUF);
-        assert_eq!(pair.write(&data[..1]), 0, "expected the pair to be full");
+        // Fill our half completely.
+        assert_eq!(pair.write(&[0xCDu8; BUF]), BUF);
+        assert_eq!(pair.write(&[0u8; 1]), 0, "expected the pair to be full");
+        assert!(pair.should_retry());
 
-        // The peer (SSL side) consumes; here we simulate by reading from the
-        // opposite half via a second pair is not possible, so assert the
-        // bookkeeping instead: our half still holds the bytes for the peer.
-        assert_eq!(pair.write_pending(), BUF);
+        // Drain from the far end, which is what OpenSSL would do.
+        let mut sink = vec![0u8; BUF];
+        let mut drained = 0;
+        while drained < BUF {
+            // SAFETY-equivalent test path: read the peer half directly.
+            let n = unsafe {
+                openssl_sys::BIO_read(
+                    pair.ssl_side,
+                    sink[drained..].as_mut_ptr() as *mut c_void,
+                    (BUF - drained) as c_int,
+                )
+            };
+            assert!(n > 0, "peer half should yield the buffered bytes");
+            drained += n as usize;
+        }
+        assert_eq!(drained, BUF);
+        assert!(sink.iter().all(|b| *b == 0xCD), "bytes altered in transit");
+
+        // Capacity is back, so writing succeeds again.
+        assert_eq!(pair.write(&[0xEFu8; 512]), 512);
+        assert_eq!(pair.write_pending(), 512);
+    }
+
+    #[test]
+    fn round_trips_bytes_between_halves() {
+        let pair = BioPair::new(BUF).unwrap();
+        let payload: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+
+        assert_eq!(pair.write_ssl_side(&payload), payload.len());
+        let mut out = vec![0u8; payload.len()];
+        assert_eq!(pair.read(&mut out), payload.len());
+        assert_eq!(out, payload);
+        assert_eq!(pair.pending(), 0);
     }
 
     #[test]
