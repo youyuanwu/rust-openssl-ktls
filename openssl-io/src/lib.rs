@@ -34,12 +34,10 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-// The engine and its FFI layer are exercised by tests today; the public stream
-// that consumes them lands in the next phase. The allows below come off then.
-#[allow(dead_code)]
 mod engine;
 mod error;
-#[allow(dead_code)]
 mod ffi;
+mod stream;
 
 pub use error::Error;
+pub use stream::SslStream;

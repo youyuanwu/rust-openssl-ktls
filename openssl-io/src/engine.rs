@@ -162,6 +162,7 @@ impl TlsEngine {
     }
 
     /// True when a byte-identical `SSL_write_ex` retry is outstanding.
+    #[cfg(test)]
     pub(crate) fn retry_owed(&self) -> bool {
         self.retry_owed
     }
@@ -187,7 +188,29 @@ impl TlsEngine {
     }
 
     /// Read decrypted plaintext into `out`.
+    #[cfg(test)]
     pub(crate) fn read_plaintext(&mut self, out: &mut [u8]) -> Result<Progress, Error> {
+        // SAFETY: `&mut [u8]` is a valid `&mut [MaybeUninit<u8>]` — every
+        // initialized byte is trivially a valid maybe-initialized byte, and the
+        // callee only ever writes.
+        let uninit = unsafe {
+            std::slice::from_raw_parts_mut(
+                out.as_mut_ptr() as *mut std::mem::MaybeUninit<u8>,
+                out.len(),
+            )
+        };
+        self.read_plaintext_uninit(uninit)
+    }
+
+    /// Read decrypted plaintext directly into uninitialized memory.
+    ///
+    /// This is what lets a caller's buffer be filled without an intermediate
+    /// copy: OpenSSL writes into the buffer's spare capacity during this
+    /// synchronous call, and the caller records how much was initialized.
+    pub(crate) fn read_plaintext_uninit(
+        &mut self,
+        out: &mut [std::mem::MaybeUninit<u8>],
+    ) -> Result<Progress, Error> {
         if out.is_empty() {
             return Ok(Progress::Done(0));
         }

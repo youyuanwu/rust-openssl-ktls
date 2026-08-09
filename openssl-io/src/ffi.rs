@@ -22,12 +22,14 @@ unsafe extern "C" {
     ) -> c_int;
 
     /// `int BIO_test_flags(const BIO *b, int flags);`
+    #[cfg(test)]
     fn BIO_test_flags(b: *const openssl_sys::BIO, flags: c_int) -> c_int;
 }
 
 /// `BIO_ctrl` command for "bytes readable on this BIO".
 const BIO_CTRL_PENDING: c_int = 10;
 /// `BIO_ctrl` command for "bytes still buffered for the peer BIO".
+#[cfg(test)]
 const BIO_CTRL_WPENDING: c_int = 13;
 
 /// The two halves of an OpenSSL BIO pair.
@@ -81,6 +83,7 @@ impl BioPair {
     }
 
     /// Bytes still buffered on our half awaiting OpenSSL's attention.
+    #[cfg(test)]
     pub(crate) fn write_pending(&self) -> usize {
         // SAFETY: as above.
         let n =
@@ -116,6 +119,7 @@ impl BioPair {
     }
 
     /// Whether our half is asking to be retried rather than reporting failure.
+    #[cfg(test)]
     pub(crate) fn should_retry(&self) -> bool {
         // SAFETY: `app_side` is a live BIO.
         unsafe { BIO_test_flags(self.app_side, openssl_sys::BIO_FLAGS_SHOULD_RETRY) != 0 }
