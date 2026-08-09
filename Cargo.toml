@@ -11,6 +11,8 @@ openssl-sys = { version = "0.9", default-features = false }
 # dev deps
 tokio-util = "0.7"
 rand = "0.10"
+criterion = { version = "0.8", features = ["async_tokio"] }
+tokio-openssl = "0.6"
 
 # crate in this workspace
 openssl-ktls = { path = "openssl-ktls" }

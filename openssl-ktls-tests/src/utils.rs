@@ -1,4 +1,4 @@
-use openssl::ssl::{SslConnector, SslVersion};
+use openssl::ssl::{SslConnector, SslConnectorBuilder, SslVersion};
 
 pub const HELLO: &str = "hello";
 
@@ -77,7 +77,7 @@ pub mod ssl_gen {
     }
 }
 
-pub(crate) fn create_openssl_acceptor_builder(
+pub fn create_openssl_acceptor_builder(
     cert: &openssl::x509::X509,
     key: &openssl::pkey::PKey<openssl::pkey::Private>,
 ) -> openssl::ssl::SslAcceptorBuilder {
@@ -101,15 +101,9 @@ pub(crate) fn create_openssl_acceptor_builder(
     acceptor
 }
 
-pub(crate) fn create_openssl_connector_with_ktls(cert: &openssl::x509::X509) -> SslConnector {
+pub fn create_openssl_connector_builder(cert: &openssl::x509::X509) -> SslConnectorBuilder {
     let mut connector =
         openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls()).unwrap();
-
-    connector.set_options(openssl_ktls::option::SSL_OP_ENABLE_KTLS);
-    // ktls requires a cipher that supports it
-    connector
-        .set_cipher_list(openssl_ktls::option::ECDHE_RSA_AES128_GCM_SHA256)
-        .unwrap();
 
     connector.cert_store_mut().add_cert(cert.clone()).unwrap();
     connector.add_client_ca(cert).unwrap();
@@ -123,5 +117,17 @@ pub(crate) fn create_openssl_connector_with_ktls(cert: &openssl::x509::X509) -> 
     connector
         .set_min_proto_version(Some(SslVersion::TLS1_2))
         .unwrap();
+    connector
+}
+
+pub fn create_openssl_connector_with_ktls(cert: &openssl::x509::X509) -> SslConnector {
+    let mut connector = create_openssl_connector_builder(cert);
+
+    connector.set_options(openssl_ktls::option::SSL_OP_ENABLE_KTLS);
+    // ktls requires a cipher that supports it
+    connector
+        .set_cipher_list(openssl_ktls::option::ECDHE_RSA_AES128_GCM_SHA256)
+        .unwrap();
+
     connector.build()
 }
