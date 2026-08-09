@@ -349,7 +349,7 @@ impl TlsEngine {
 }
 
 #[cfg(test)]
-#[path = "../tests/common/mod.rs"]
+#[path = "../tests/common/certs.rs"]
 mod common;
 
 #[cfg(test)]

@@ -18,3 +18,4 @@ compio-buf.workspace = true
 # and TcpStream. Enabling both driver backends here is deliberate — compio's
 # io_uring -> polling fallback only exists when both features are on.
 compio = { workspace = true, features = ["net", "macros", "time", "polling"] }
+compio-buf.workspace = true
