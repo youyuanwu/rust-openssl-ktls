@@ -154,6 +154,9 @@ into owned chunks in a `VecDeque<Vec<u8>>` that stay alive until the caller drai
 `write_tls` can build `IoSlice`s over them and issue one `write_vectored`. OpenSSL cannot,
 because its record layer owns the I/O loop and must recycle its write buffer per record.
 
+Why OpenSSL cannot simply encrypt into the BIO's own buffer, and which copies on the write
+path are removable at all, is covered in [ZeroCopy.md](ZeroCopy.md).
+
 ## Methodology
 
 The following choices matter for interpreting the numbers:
