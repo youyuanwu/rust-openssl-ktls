@@ -2,7 +2,8 @@
 pub mod async_ktls;
 #[cfg(test)]
 pub mod ktls;
-#[cfg(test)]
 pub mod utils;
+#[cfg(test)]
+pub mod write_counts;
 
 pub mod exp;

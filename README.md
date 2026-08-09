@@ -41,5 +41,9 @@ let receive_enabled = ssl_s.ktls_recv_enabled();
 let send_enabled = ssl_s.ktls_send_enabled();
 ```
 
+# Benchmarks
+Write-path benchmarks live in `openssl-ktls-tests/benches/`. See [docs/Benchmarks.md](docs/Benchmarks.md)
+for how to run them and what they show about TLS record size, syscall counts, and KTLS.
+
 # License
 This project is licensed under the MIT license.
