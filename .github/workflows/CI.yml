@@ -7,7 +7,7 @@ env:
 
 jobs:
   setup:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       rust-msrv: ${{ env.RUST_MSRV }}
       rust-version: ${{ steps.parse.outputs.version }}
@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest ]
+        os: [ ubuntu-26.04 ]
         rust: [ '${{ needs.setup.outputs.rust-msrv }}', '${{ needs.setup.outputs.rust-version }}' ]
     steps:
     - uses: actions/checkout@v7
@@ -36,6 +36,13 @@ jobs:
         components: rustfmt, clippy, llvm-tools
 
     - uses: taiki-e/install-action@cargo-llvm-cov
+
+    - name: Setup system openssl and kernel tls
+      run: |
+        sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+        sudo modprobe tls
+        cat /proc/sys/net/ipv4/tcp_available_ulp
+        openssl version -a
 
     - name: Run cargo check
       run: cargo +${{ matrix.rust }} check --locked

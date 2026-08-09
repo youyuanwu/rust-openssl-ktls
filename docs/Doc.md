@@ -1,11 +1,22 @@
 # MISC
 
-openssl on ubuntu does not have ktls.
+This crate links against the system openssl, which needs to be built with
+`enable-ktls`. Recent Debian/Ubuntu openssl 3.x packages have it enabled, so no
+vendored build is required. Verify and load the kernel `tls` module:
 ```sh
 # check kmod
 lsmod | grep tls
 sudo modprobe tls
 
+# check the tls ulp is available
+cat /proc/sys/net/ipv4/tcp_available_ulp
+
+openssl version -a
+```
+
+If your system openssl lacks ktls, build one and point `OPENSSL_DIR` at it, for
+example using vcpkg:
+```sh
 # remove system install 
 sudo apt remove libssl-dev 
 # insall from vcpkg
@@ -17,11 +28,10 @@ perl ${VCPKG_ROOT}/buildtrees/openssl/x64-linux-dbg/configdata.pm --dump | grep 
 nm -C ${VCPKG_ROOT}/installed/x64-linux/debug/lib/libssl.a | grep SSL_connect
 nm -C ${VCPKG_ROOT}/installed/x64-linux/debug/lib/libssl.a | grep BIO_get_ktls_send
 
-
-nm -C target/debug/build/openssl-sys-8ae939011d026d94/out/openssl-build/install/lib/libssl.a | grep ktls
-
 nm -D /usr/lib/x86_64-linux-gnu/libssl.so | grep ktls
+```
 
+```sh
 # Monitor KTLS setsockopt calls
 bpftrace -e 'tracepoint:syscalls:sys_enter_setsockopt /args->optname == 0x1b/ { printf("KTLS setsockopt triggered\n"); }'
 

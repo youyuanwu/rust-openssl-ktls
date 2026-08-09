@@ -6,8 +6,8 @@ publish = false
 
 [dependencies]
 tokio.workspace = true
-openssl = { workspace = true, features = ["vendored"] , default-features = false}
-openssl-sys = { workspace = true, features = ["vendored"] , default-features = false}
+openssl = { workspace = true, features = [] , default-features = false}
+openssl-sys = { workspace = true, features = [] , default-features = false}
 openssl-ktls.workspace = true
 foreign-types-shared.workspace = true
 
@@ -15,6 +15,3 @@ foreign-types-shared.workspace = true
 tokio-util.workspace = true
 rand.workspace = true
 
-
-[build-dependencies]
-openssl-src = { workspace = true, features = ["ktls"], default-features = false }
