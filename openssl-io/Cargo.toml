@@ -67,3 +67,8 @@ required-features = ["compio"]
 name = "transport"
 path = "tests/transport.rs"
 required-features = ["compio"]
+
+[[test]]
+name = "tokio_transport"
+path = "tests/tokio_transport.rs"
+required-features = ["tokio"]
