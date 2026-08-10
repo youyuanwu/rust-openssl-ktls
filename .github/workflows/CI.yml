@@ -3,7 +3,10 @@ name: build
 on: [push, pull_request, workflow_dispatch]
 
 env:
-  RUST_MSRV: "1.90.0"
+  # Raised from 1.90.0 for `openssl-io`. Note the driver is that crate's
+  # dev-dependency on the `compio` umbrella (compio-executor uses `cfg_select!`,
+  # stabilized in 1.95); openssl-io's own library dependencies build on 1.93.
+  RUST_MSRV: "1.95.0"
 
 jobs:
   setup:

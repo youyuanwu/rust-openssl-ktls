@@ -47,5 +47,10 @@ for how to run them and what they show about TLS record size, syscall counts, an
 and [docs/ZeroCopy.md](docs/ZeroCopy.md) for which copies on the write path can be removed
 and why.
 
+# Related crates (experimental)
+`openssl-io` is an unpublished experiment providing a completion-based async OpenSSL stream
+for the [compio](https://docs.rs/compio) runtime. It does not target KTLS.
+See [docs/CompioStream.md](docs/CompioStream.md).
+
 # License
 This project is licensed under the MIT license.

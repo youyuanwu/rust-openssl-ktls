@@ -1,0 +1,22 @@
+[package]
+name = "openssl-io"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Experimental completion-based (compio) async OpenSSL stream"
+
+[dependencies]
+openssl = { workspace = true, features = [], default-features = false }
+openssl-sys = { workspace = true, features = [], default-features = false }
+foreign-types-shared.workspace = true
+compio-io.workspace = true
+compio-buf.workspace = true
+
+[dev-dependencies]
+# The umbrella crate is test-only: it supplies the runtime, `#[compio::test]`,
+# TcpStream, and timeouts. Its defaults (runtime, io-uring) are all needed.
+# `polling` costs one extra crate and buys a real fallback: without it, a host
+# where io_uring is unavailable fails outright instead of degrading
+# (compio-driver fusion only falls back when both backends are compiled in).
+compio = { workspace = true, features = ["net", "macros", "time", "polling"] }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = [ "openssl-ktls", "openssl-ktls-tests"]
+members = [ "openssl-ktls", "openssl-ktls-tests", "openssl-io"]
 
 [workspace.dependencies]
 foreign-types-shared = "0.1"
@@ -8,11 +8,19 @@ tokio = { version = "1", features = ["full"] , default-features = false }
 openssl = { version = "0.10", default-features = false }
 openssl-sys = { version = "0.9", default-features = false }
 
+# completion-based io (openssl-io).
+# default-features = false drops `bytes`, which openssl-io does not use.
+# `arrayvec` still arrives because compio-io hardcodes it, and futures-util /
+# synchrony / pastey are non-optional dependencies of compio-io.
+compio-io = { version = "0.10", default-features = false }
+compio-buf = { version = "0.8", default-features = false }
+
 # dev deps
 tokio-util = "0.7"
 rand = "0.10"
 criterion = { version = "0.8", features = ["async_tokio"] }
 tokio-openssl = "0.6"
+compio = "0.19"
 
 # crate in this workspace
 openssl-ktls = { path = "openssl-ktls" }
