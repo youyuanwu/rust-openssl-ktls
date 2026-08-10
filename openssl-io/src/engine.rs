@@ -24,7 +24,10 @@ use crate::ffi::BioPair;
 /// typical record round-trips without repeated pumping, small enough that a
 /// stalled peer cannot make us buffer without bound — which is precisely why
 /// this crate uses a BIO pair rather than a memory BIO.
-const PAIR_BUF: usize = 4 * MAX_RECORD;
+///
+/// Visible to the adapters so a runtime pump can assert its own ciphertext
+/// backlog is at least large enough to absorb a completely full pair.
+pub(crate) const PAIR_BUF: usize = 4 * MAX_RECORD;
 
 /// `SSL3_RT_MAX_PLAIN_LENGTH`: the most plaintext OpenSSL will accept in one
 /// `SSL_write_ex` call. Measured, not assumed — see `docs/CompioStream.md`.
