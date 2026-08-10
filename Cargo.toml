@@ -8,9 +8,12 @@ tokio = { version = "1", features = ["full"] , default-features = false }
 openssl = { version = "0.10", default-features = false }
 openssl-sys = { version = "0.9", default-features = false }
 
-# completion-based io (openssl-io)
-compio-io = "0.10"
-compio-buf = "0.8"
+# completion-based io (openssl-io).
+# default-features = false drops `bytes`, which openssl-io does not use.
+# `arrayvec` still arrives because compio-io hardcodes it, and futures-util /
+# synchrony / pastey are non-optional dependencies of compio-io.
+compio-io = { version = "0.10", default-features = false }
+compio-buf = { version = "0.8", default-features = false }
 
 # dev deps
 tokio-util = "0.7"

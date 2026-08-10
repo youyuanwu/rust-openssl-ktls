@@ -15,7 +15,8 @@ compio-buf.workspace = true
 
 [dev-dependencies]
 # The umbrella crate is test-only: it supplies the runtime, `#[compio::test]`,
-# and TcpStream. Enabling both driver backends here is deliberate — compio's
-# io_uring -> polling fallback only exists when both features are on.
+# TcpStream, and timeouts. Its defaults (runtime, io-uring) are all needed.
+# `polling` costs one extra crate and buys a real fallback: without it, a host
+# where io_uring is unavailable fails outright instead of degrading
+# (compio-driver fusion only falls back when both backends are compiled in).
 compio = { workspace = true, features = ["net", "macros", "time", "polling"] }
-compio-buf.workspace = true
