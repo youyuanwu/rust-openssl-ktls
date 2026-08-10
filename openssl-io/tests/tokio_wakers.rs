@@ -22,9 +22,10 @@
 mod common;
 
 use std::future::Future;
+use std::mem::ManuallyDrop;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, RawWaker, RawWakerVTable, Wake, Waker};
 use std::time::Duration;
 
@@ -681,120 +682,187 @@ async fn a_cancelled_writer_cannot_strand_a_parked_reader() {
     .expect("the cancelled-writer regression timed out");
 }
 
-/// Build a `Waker` whose `clone` and `drop` run `hook`.
+/// A hook the waker vtable below runs from `clone` and `drop`.
 ///
-/// `std::task::Wake` cannot express this: `Waker::from(Arc<W>)` clones and drops
-/// the `Arc`, never user code. A hand-built vtable can, and the `Waker` contract
-/// permits it — nothing says `clone` and `drop` are trivial, and a real
-/// combinator may well wake something from either. So a registry that runs them
-/// under its own lock is one re-entrant waker away from deadlocking.
-fn reentrant_waker(hook: Arc<dyn Fn() + Send + Sync>) -> Waker {
-    unsafe fn clone(data: *const ()) -> RawWaker {
-        // SAFETY: `data` is the leaked `Arc` this vtable was built with, still
-        // alive because the `Waker` owning it has not been dropped.
-        let hook = unsafe { Arc::from_raw(data as *const HookFn) };
-        (hook.0)();
-        let cloned = hook.clone();
-        std::mem::forget(hook);
-        RawWaker::new(Arc::into_raw(cloned) as *const (), &VTABLE)
-    }
-    unsafe fn wake(data: *const ()) {
-        // SAFETY: as above; this consumes the reference the waker owned.
-        let hook = unsafe { Arc::from_raw(data as *const HookFn) };
-        (hook.0)();
-    }
-    unsafe fn wake_by_ref(data: *const ()) {
-        // SAFETY: as above, without consuming the reference.
-        let hook = unsafe { Arc::from_raw(data as *const HookFn) };
-        (hook.0)();
-        std::mem::forget(hook);
-    }
-    unsafe fn drop_fn(data: *const ()) {
-        // SAFETY: as above; releases the reference this waker held.
-        let hook = unsafe { Arc::from_raw(data as *const HookFn) };
-        (hook.0)();
-    }
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_fn);
-
-    let boxed = Arc::new(HookFn(hook));
-    // SAFETY: the pointer comes from `Arc::into_raw` and the vtable above only
-    // ever reconstitutes it with the matching `Arc::from_raw`.
-    unsafe { Waker::from_raw(RawWaker::new(Arc::into_raw(boxed) as *const (), &VTABLE)) }
+/// Arming is separate from construction so a test can decide *which* of the two
+/// registration steps re-enters the stream.
+struct Hook {
+    armed: AtomicBool,
+    controls: Controls,
 }
 
-struct HookFn(Arc<dyn Fn() + Send + Sync>);
+impl Hook {
+    fn new(controls: Controls) -> Arc<Self> {
+        Arc::new(Hook {
+            armed: AtomicBool::new(false),
+            controls,
+        })
+    }
 
-/// Registering a waker must not run caller code under the registry's lock.
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Re-enter the stream through the transport's retained registration, which
+    /// is the stream's own stable write waker.
+    fn fire(&self) {
+        if self.armed.load(Ordering::SeqCst) {
+            self.controls.open_write_gate();
+            self.controls.close_write_gate();
+        }
+    }
+}
+
+/// Build a `Waker` whose `clone` and `drop` run `hook`.
+///
+/// [`std::task::Wake`] cannot express this: `Waker::from(Arc<W>)` clones and
+/// drops the `Arc`, never user code. A hand-written vtable can, and the `Waker`
+/// contract permits it — nothing requires `clone` and `drop` to be trivial, and
+/// a real combinator may wake something from either. A registry that runs them
+/// under its own lock is one such waker away from deadlocking.
+fn reentrant_waker(hook: Arc<Hook>) -> Waker {
+    /// Reference counting: `clone` adds one, `wake` and `drop` each consume the
+    /// one they were given, `wake_by_ref` leaves the count alone. The two
+    /// non-consuming callbacks reconstitute the `Arc` inside a `ManuallyDrop`,
+    /// so a panic escaping the hook cannot also consume the caller's reference
+    /// and leave the `RawWaker` dangling.
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_fn);
+
+    unsafe fn clone(data: *const ()) -> RawWaker {
+        // SAFETY: `data` came from `Arc::into_raw` for this vtable, and the
+        // `Waker` holding it is still alive, so the pointee is live.
+        let hook = ManuallyDrop::new(unsafe { Arc::from_raw(data as *const Hook) });
+        // Take the new reference *before* running the hook: if the hook
+        // unwinds, `cloned` releases only its own reference and the caller's is
+        // untouched.
+        let cloned = Arc::clone(&hook);
+        cloned.fire();
+        RawWaker::new(Arc::into_raw(cloned) as *const (), &VTABLE)
+    }
+
+    unsafe fn wake(data: *const ()) {
+        // SAFETY: as in `clone`. `wake` consumes the reference by contract, so
+        // this one is deliberately not a `ManuallyDrop`.
+        let hook = unsafe { Arc::from_raw(data as *const Hook) };
+        hook.fire();
+    }
+
+    unsafe fn wake_by_ref(data: *const ()) {
+        // SAFETY: as in `clone`. `wake_by_ref` must not consume the reference.
+        let hook = ManuallyDrop::new(unsafe { Arc::from_raw(data as *const Hook) });
+        hook.fire();
+    }
+
+    unsafe fn drop_fn(data: *const ()) {
+        // SAFETY: as in `clone`. `drop` consumes the reference by contract.
+        let hook = unsafe { Arc::from_raw(data as *const Hook) };
+        hook.fire();
+    }
+
+    // SAFETY: the pointer comes from `Arc::into_raw` and every vtable entry
+    // above reconstitutes it with the matching `Arc::from_raw`.
+    unsafe { Waker::from_raw(RawWaker::new(Arc::into_raw(hook) as *const (), &VTABLE)) }
+}
+
+/// Run `body` on its own thread and fail if it does not finish.
+///
+/// A deadlock inside the stream would otherwise hang the whole suite instead of
+/// reporting which schedule broke.
+fn assert_completes<F>(what: &str, body: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        body();
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap_or_else(|_| panic!("{what} deadlocked the stream"));
+}
+
+/// Park a read behind a shut write gate, with `stranded` ciphertext queued.
+///
+/// Returns the pieces a re-entrancy schedule needs: the stream, a live peer so
+/// the transport does not report end of stream, and the controls the hook
+/// re-enters through.
+fn stranded_pair() -> (Stream, Stream, Controls) {
+    let rt = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let Pair {
+            mut client,
+            server,
+            client_controls,
+            ..
+        } = connected().await;
+        client_controls.close_write_gate();
+        client.write_all(b"stranded").await.unwrap();
+        (client, server, client_controls)
+    })
+}
+
+/// Registration must not *clone* the incoming waker under the registry's lock.
 ///
 /// The stream keeps one waker per direction behind a mutex, and the same mutex
 /// is taken when the transport delivers write readiness. Cloning the incoming
-/// waker, and dropping the one it displaces, therefore have to happen outside
-/// the guard. A waker whose `clone`/`drop` wakes the stream would otherwise
-/// re-enter that mutex and hang the task instead of failing it.
-///
-/// Driven on its own thread so a deadlock shows up as a failed assertion rather
-/// than a hung suite.
-#[tokio::test]
-async fn registering_a_reentrant_waker_does_not_deadlock() {
-    let (tx, rx) = std::sync::mpsc::channel();
+/// waker therefore has to happen outside the guard.
+#[test]
+fn a_reentrant_waker_clone_does_not_deadlock_registration() {
+    assert_completes("cloning a re-entrant waker", || {
+        let (mut client, _server, controls) = stranded_pair();
 
-    std::thread::spawn(move || {
-        let body = async {
-            let Pair {
-                mut client,
-                server,
-                client_controls,
-                ..
-            } = connected().await;
-            // Keep the peer alive; dropping it would close the transport and
-            // make the read below fail instead of park.
-            let _server = server;
+        let hook = Hook::new(controls);
+        hook.arm();
+        let waker = reentrant_waker(hook);
 
-            client_controls.close_write_gate();
-            client.write_all(b"stranded").await.unwrap();
-
-            // Park a read so the stream holds a registration, then re-poll with
-            // a different waker so registration both clones the newcomer and
-            // drops the one it displaces. Each of those fires the hook, which
-            // wakes the stream's own stable transport waker.
-            let reenter: Arc<dyn Fn() + Send + Sync> = {
-                let controls = client_controls.clone();
-                Arc::new(move || {
-                    // Reaches the stream through the transport's retained
-                    // registration, which is the stable waker under test.
-                    controls.open_write_gate();
-                    controls.close_write_gate();
-                })
-            };
-
-            let mut buf = [0u8; 64];
-            let mut read = Box::pin(client.read(&mut buf));
-            assert!(
-                read.as_mut()
-                    .poll(&mut Context::from_waker(&reentrant_waker(reenter.clone())))
-                    .is_pending(),
-                "no reply can arrive while the gate is shut"
-            );
-            assert!(
-                read.as_mut()
-                    .poll(&mut Context::from_waker(&reentrant_waker(reenter)))
-                    .is_pending(),
-                "still nothing to read"
-            );
-
-            // Reaching here is the assertion: registration completed without
-            // re-entering its own lock.
-            drop(read);
-        };
-
-        ::tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(body);
-        let _ = tx.send(());
+        let mut storage = [0u8; 64];
+        let mut buf = ReadBuf::new(&mut storage);
+        // Registration clones this waker, which re-enters the stream.
+        let polled = Pin::new(&mut client).poll_read(&mut Context::from_waker(&waker), &mut buf);
+        assert!(
+            polled.is_pending(),
+            "no reply can arrive while the gate is shut"
+        );
     });
+}
 
-    rx.recv_timeout(std::time::Duration::from_secs(10))
-        .expect("registering a re-entrant waker deadlocked the stream");
+/// Registration must not *drop* the waker it displaces under the lock either.
+///
+/// The displaced waker is dropped only when a second, different waker takes its
+/// slot, so this is a distinct path from the clone above and needs its own
+/// schedule: park with a disarmed waker, arm it, then park with another.
+#[test]
+fn a_reentrant_waker_drop_does_not_deadlock_registration() {
+    assert_completes("dropping a displaced re-entrant waker", || {
+        let (mut client, _server, controls) = stranded_pair();
+
+        let first = Hook::new(controls.clone());
+        let first_waker = reentrant_waker(first.clone());
+
+        let mut storage = [0u8; 64];
+        let mut buf = ReadBuf::new(&mut storage);
+        assert!(
+            Pin::new(&mut client)
+                .poll_read(&mut Context::from_waker(&first_waker), &mut buf)
+                .is_pending(),
+            "no reply can arrive while the gate is shut"
+        );
+
+        // Only now does the stored clone of `first_waker` become re-entrant, so
+        // the re-entrancy comes from dropping it rather than from cloning it.
+        first.arm();
+
+        let second = Hook::new(controls);
+        let second_waker = reentrant_waker(second);
+        let mut buf = ReadBuf::new(&mut storage);
+        assert!(
+            Pin::new(&mut client)
+                .poll_read(&mut Context::from_waker(&second_waker), &mut buf)
+                .is_pending(),
+            "still nothing to read"
+        );
+    });
 }
