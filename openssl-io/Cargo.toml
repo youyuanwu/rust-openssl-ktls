@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 license = "MIT"
-description = "Experimental completion-based (compio) async OpenSSL stream"
+description = "Experimental async OpenSSL streams for compio and tokio, sharing one TLS engine"
 
 [dependencies]
 openssl = { workspace = true, features = [], default-features = false }

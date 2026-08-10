@@ -48,6 +48,66 @@
 //! every path to the external crate is written absolutely as `::tokio::...`,
 //! here and in shared code.
 //!
+//! # Usage
+//!
+//! The stream wraps one transport implementing tokio's [`AsyncRead`] and
+//! [`AsyncWrite`], and implements those traits itself. Use
+//! [`tokio::io::split`](https://docs.rs/tokio/latest/tokio/io/fn.split.html)
+//! for a reading and a writing half.
+//!
+//! Connecting as a client:
+//!
+//! ```no_run
+//! use openssl::ssl::{SslConnector, SslMethod};
+//! use openssl_io::tokio::SslStream;
+//! use tokio::io::{AsyncReadExt, AsyncWriteExt};
+//!
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let tcp = tokio::net::TcpStream::connect("example.com:4433").await?;
+//!
+//! // `configure().into_ssl(domain)` is what sets SNI and hostname
+//! // verification. Building an `Ssl` straight from the context skips both, so
+//! // a certificate trusted for some *other* host would be accepted.
+//! let connector = SslConnector::builder(SslMethod::tls())?.build();
+//! let ssl = connector.configure()?.into_ssl("example.com")?;
+//!
+//! let mut stream = SslStream::new(ssl, tcp)?;
+//! stream.connect().await?;
+//!
+//! stream.write_all(b"GET / HTTP/1.0\r\n\r\n").await?;
+//! // A write is accepted by TLS immediately, but only guaranteed delivered
+//! // once flushed. Reading would push it out too; flushing says so plainly.
+//! stream.flush().await?;
+//!
+//! let mut body = Vec::new();
+//! stream.read_to_end(&mut body).await?;
+//! stream.shutdown().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Accepting as a server:
+//!
+//! ```no_run
+//! use openssl::ssl::Ssl;
+//! use openssl_io::tokio::SslStream;
+//! use tokio::io::AsyncReadExt;
+//!
+//! # async fn run(acceptor: openssl::ssl::SslAcceptor) -> Result<(), Box<dyn std::error::Error>> {
+//! let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+//! let (tcp, _peer) = listener.accept().await?;
+//!
+//! let ssl = Ssl::new(acceptor.context())?;
+//! let mut stream = SslStream::new(ssl, tcp)?;
+//! stream.accept().await?;
+//!
+//! let mut buf = vec![0u8; 4096];
+//! let n = stream.read(&mut buf).await?;
+//! println!("{n} plaintext bytes");
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! [tokio]: https://docs.rs/tokio
 
 use std::io;

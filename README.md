@@ -48,9 +48,11 @@ and [docs/ZeroCopy.md](docs/ZeroCopy.md) for which copies on the write path can 
 and why.
 
 # Related crates (experimental)
-`openssl-io` is an unpublished experiment providing a completion-based async OpenSSL stream
-for the [compio](https://docs.rs/compio) runtime. It does not target KTLS.
-See [docs/CompioStream.md](docs/CompioStream.md).
+`openssl-io` is an unpublished experiment providing async OpenSSL streams for two runtimes,
+both driven by one shared synchronous TLS engine: a completion-based binding for
+[compio](https://docs.rs/compio) and a readiness-based one for [tokio](https://docs.rs/tokio).
+Each lives behind its own Cargo feature. Neither targets KTLS.
+See [docs/CompioStream.md](docs/CompioStream.md) and [docs/TokioStream.md](docs/TokioStream.md).
 
 # License
 This project is licensed under the MIT license.
