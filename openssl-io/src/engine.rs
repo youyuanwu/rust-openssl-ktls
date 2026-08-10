@@ -172,7 +172,13 @@ impl TlsEngine {
     }
 
     /// True when a byte-identical `SSL_write_ex` retry is outstanding.
-    #[cfg(test)]
+    ///
+    /// Available to debug builds as well as tests because a readiness-based
+    /// adapter cannot afford to park a write while OpenSSL is owed a retry —
+    /// the next poll may legitimately arrive with a different buffer, which
+    /// OpenSSL rejects permanently. Asserting the invariant is only useful
+    /// where assertions run, so the predicate is compiled where they do.
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn retry_owed(&self) -> bool {
         self.retry_owed
     }
@@ -265,13 +271,20 @@ impl TlsEngine {
         if self.state == State::Failed {
             return Err(Error::tls());
         }
-        debug_assert!(
-            !self.retry_owed || self.retry_len == data.len(),
-            "SSL_write_ex retry must present the identical buffer it was first given \
-             (owed {} bytes, got {})",
-            self.retry_len,
-            data.len()
-        );
+        // Gated as a block rather than written as a bare `debug_assert!`: the
+        // predicate itself only exists where assertions run, and a
+        // `debug_assert!` would still type-check its argument in a build with
+        // assertions off.
+        #[cfg(debug_assertions)]
+        {
+            assert!(
+                !self.retry_owed() || self.retry_len == data.len(),
+                "SSL_write_ex retry must present the identical buffer it was first given \
+                 (owed {} bytes, got {})",
+                self.retry_len,
+                data.len()
+            );
+        }
 
         let mut put = 0usize;
         // SAFETY: `data` is valid for `data.len()` bytes; `put` is a live local.

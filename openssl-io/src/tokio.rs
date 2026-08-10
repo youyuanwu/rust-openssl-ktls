@@ -2,11 +2,11 @@
 //!
 //! # Status
 //!
-//! **Partially implemented.** Construction, session inspection, the explicit
-//! client and server handshakes, and tokio's [`AsyncRead`] are in place. The
-//! write half — `AsyncWrite`, flush, TLS shutdown, and transport recovery — is
-//! not yet exposed, so the stream is currently usable for handshaking and for
-//! reading plaintext a peer sends.
+//! **Experimental.** Construction, session inspection, the explicit client and
+//! server handshakes, tokio's [`AsyncRead`] and [`AsyncWrite`], TLS shutdown,
+//! and guarded transport recovery are in place. Peer-initiated renegotiation
+//! and TLS 1.3 key update are not handled: either one terminates the write
+//! direction with [`Error::Tls`] while reads continue.
 //!
 //! # Design
 //!
@@ -18,13 +18,19 @@
 //! transport future across a return. That is what makes a cancelled operation
 //! ordinary rather than indeterminate here.
 //!
-//! Three rules govern the pump and are worth stating up front, because the
+//! Four rules govern the pump and are worth stating up front, because the
 //! rest of the module is their consequence:
 //!
 //! - **The handshake is explicit.** A read before [`SslStream::connect`] or
 //!   [`SslStream::accept`] fails with [`Error::HandshakeRequired`] before any
 //!   transport poll happens at all. The role cannot be inferred from a read, so
 //!   guessing one would be worse than refusing.
+//! - **A write decides to park before OpenSSL is called.** `SSL_write_ex`
+//!   demands that a retry present the byte-identical buffer, and tokio's
+//!   `AsyncWrite` contract lets the next poll bring a different one; a
+//!   violation is a permanent, session-killing "bad write retry" rather than a
+//!   stall. So plaintext is offered only when nothing is queued in the engine
+//!   or in this stream, and a pending write has consumed nothing.
 //! - **Read and write waiters are stored separately.** A transport retains one
 //!   waker per direction, so when a read poll uses the transport's *write* side
 //!   and finds it not ready, it hands that single slot back by waking the
@@ -34,7 +40,9 @@
 //!   best-effort until flush, so the read path must push any residual backlog
 //!   out; otherwise "write a request, then read the reply" could deadlock with
 //!   the request stranded. A failure of that write-side drain is never reported
-//!   as the read's own result — a read reports read-side outcomes only.
+//!   as the read's own result — a read reports read-side outcomes only — and
+//!   the drain is skipped entirely once the write direction is closing or has
+//!   failed, so a half-shutdown read cannot resurface a write-side error.
 //!
 //! Note that `mod tokio` shadows the `tokio` crate at this crate's root, so
 //! every path to the external crate is written absolutely as `::tokio::...`,
@@ -50,7 +58,7 @@ use openssl::ssl::{Ssl, SslRef};
 
 use ::tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::engine::{CIPHER_CHUNK, MAX_RECORD, Progress, Role, TlsEngine};
+use crate::engine::{CIPHER_CHUNK, MAX_RECORD, PAIR_BUF, Progress, Role, TlsEngine};
 use crate::error::Error;
 
 /// Structural ceiling on ciphertext buffered on the caller's behalf.
@@ -60,6 +68,59 @@ use crate::error::Error;
 /// the stream refuses to take. It is a ceiling, not an expected occupancy: one
 /// `SSL_write_ex` emits at most one record.
 const OUTBOUND_LIMIT: usize = 4 * MAX_RECORD;
+
+// The ceiling has to absorb a completely full pair, or `collect_outbound`
+// could refuse ciphertext OpenSSL has already committed to.
+const _: () = assert!(
+    OUTBOUND_LIMIT >= PAIR_BUF,
+    "the ciphertext backlog must be able to absorb a full BIO pair"
+);
+
+/// How far the closure sequence has got.
+///
+/// Shutdown is several steps over a transport that can park at any of them, so
+/// the phase is latched rather than recomputed: `close_notify` is emitted
+/// exactly once no matter how often the trait method is polled or retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ShutdownState {
+    /// No closure has been started.
+    Open,
+    /// `close_notify` has been produced by the engine.
+    TlsClosed,
+    /// Every byte of it has reached the transport, which has been flushed.
+    TransportFlushed,
+    /// The transport's own shutdown has completed.
+    Done,
+}
+
+/// A terminal condition on the write direction.
+///
+/// Reads stay usable in both cases — this latches only what the *write* half
+/// may still do — and the distinction matters: one of them still permits a
+/// closure notification and the other does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteFailure {
+    /// The session is closed for application data. The peer sent
+    /// `close_notify`, or this side already did, so no further plaintext can be
+    /// accepted. `SSL_shutdown` remains legal and flush still reports success:
+    /// nothing failed, the direction is simply finished.
+    Closed,
+    /// A fatal post-handshake TLS condition. OpenSSL must not be re-entered, so
+    /// no new `close_notify` can be synthesized; ciphertext already produced is
+    /// still delivered, and every write-side result reports this classification.
+    Tls,
+}
+
+impl WriteFailure {
+    /// The classification a latched failure reports, rebuilt on each use
+    /// because `Error` is not `Copy`.
+    fn to_error(self) -> Error {
+        match self {
+            WriteFailure::Closed => Error::Closed,
+            WriteFailure::Tls => Error::tls(),
+        }
+    }
+}
 
 /// Outcome of a write-side drain performed on behalf of a *read*.
 ///
@@ -75,6 +136,9 @@ enum Drain {
     Pending,
     /// The transport failed. The error was latched for the write direction.
     Failed,
+    /// The drain was suppressed because the write direction is shutting down or
+    /// has failed terminally. Nothing was polled and nothing was latched.
+    Skipped,
 }
 
 /// What one inbound pump step achieved.
@@ -132,10 +196,21 @@ pub struct SslStream<S> {
     /// A read that drains queued ciphertext can hit one, and reporting it as
     /// the read's outcome would collide with the truncation-versus-clean-EOF
     /// distinction. It is latched here for the write direction to surface
-    /// instead, so the failure is neither dropped nor misattributed.
-    // The consumers — `poll_write`, `poll_flush`, and `poll_shutdown` — arrive
-    // with the write half in the next phase; the producer already exists here.
+    /// instead, so the failure is neither dropped nor misattributed. A write's
+    /// own best-effort drain uses it too: once TLS has accepted plaintext,
+    /// returning the transport's error instead of the accepted count would lose
+    /// the caller's bytes.
+    ///
+    /// `poll_write`, `poll_flush`, and `poll_shutdown` each take it before
+    /// doing anything else, so it is reported exactly once and only on the
+    /// write side.
     pending_write_error: Option<Error>,
+
+    /// How far closure has progressed, so each step happens at most once.
+    shutdown_state: ShutdownState,
+
+    /// A latched terminal condition on the write direction, if any.
+    write_failure: Option<WriteFailure>,
 }
 
 impl<S> SslStream<S> {
@@ -155,6 +230,8 @@ impl<S> SslStream<S> {
             read_waiter: None,
             write_waiter: None,
             pending_write_error: None,
+            shutdown_state: ShutdownState::Open,
+            write_failure: None,
         })
     }
 
@@ -183,6 +260,53 @@ impl<S> SslStream<S> {
     /// True once the peer's `close_notify` has been observed.
     pub fn is_peer_closed(&self) -> bool {
         self.engine.is_peer_closed()
+    }
+
+    /// Recover the transport, consuming the stream.
+    ///
+    /// Refused whenever handing the transport back would silently discard
+    /// state: ciphertext queued in either direction, a session that has been
+    /// terminally failed on the write side, or a closure sequence stopped
+    /// halfway through. A refusal returns the stream itself alongside the
+    /// reason, so nothing is destroyed by asking.
+    ///
+    /// A peer-closed session is *not* a refusal. Nothing failed there and
+    /// nothing is buffered; the write direction is simply finished.
+    // The error carries the whole stream back, which is the point.
+    #[allow(clippy::result_large_err)]
+    pub fn into_inner(self) -> Result<S, (Self, Error)> {
+        let refusal = if self.inbound_len() > 0 {
+            Some("ciphertext received from the transport has not been consumed")
+        } else if self.outbound_len() > 0 || self.engine.outbound_pending() > 0 {
+            Some("ciphertext produced by TLS has not reached the transport")
+        } else if self.write_failure == Some(WriteFailure::Tls) {
+            Some("the write direction failed terminally")
+        } else if self.shutdown_state != ShutdownState::Open
+            && self.shutdown_state != ShutdownState::Done
+        {
+            Some("a shutdown is only partly complete")
+        } else {
+            None
+        };
+
+        if let Some(reason) = refusal {
+            let err = Error::Transport(io::Error::other(reason));
+            return Err((self, err));
+        }
+
+        // A retry obligation is only ever created by a `write_plaintext` call
+        // that did not return `Done(n > 0)`, and every such call latches a
+        // write failure in the same poll. So an unlatched session with empty
+        // buffers cannot owe one, and recovery cannot strand accepted plaintext.
+        #[cfg(debug_assertions)]
+        {
+            assert!(
+                self.write_failure.is_some() || !self.engine.retry_owed(),
+                "recovering a transport while OpenSSL was owed a write retry"
+            );
+        }
+
+        Ok(self.transport)
     }
 
     /// The single pre-handshake guard, shared by every application-data entry
@@ -452,9 +576,19 @@ where
     /// latched for the write direction rather than returned, and a transport
     /// that is not ready costs the writer its registration, so the writer is
     /// woken to reclaim it.
-    // Every read-path drain goes through here, so the shutdown and
-    // terminal-write-failure skip guard the write half needs lands in one place.
+    ///
+    /// A third rule is the skip guard. Once the write direction is closing or
+    /// has failed terminally, a read must not touch the transport's write side
+    /// at all: a half-shutdown read that resurfaced a write-side error would
+    /// contradict the whole point of leaving the read half usable.
+    // Every read-path drain goes through here, so both the guard and the
+    // latching rule are stated exactly once.
     fn drain_for_read(&mut self, cx: &mut Context<'_>) -> Drain {
+        if self.shutdown_state != ShutdownState::Open
+            || self.write_failure == Some(WriteFailure::Tls)
+        {
+            return Drain::Skipped;
+        }
         if self.outbound_len() == 0 {
             return Drain::Complete;
         }
@@ -536,16 +670,16 @@ where
         }
 
         // Both are per-poll latches that keep the loop from retrying something
-        // that has already failed or ended.
-        let mut drain_failed = false;
+        // that has already failed, been suppressed, or ended.
+        let mut drain_stopped = false;
         let mut eof_seen = false;
 
         loop {
             // A write's delivery is best-effort until flush, so residual
             // ciphertext must not be left stranded while this side waits on the
             // peer. The read never parks on this drain.
-            if !drain_failed && self.drain_for_read(cx) == Drain::Failed {
-                drain_failed = true;
+            if !drain_stopped && matches!(self.drain_for_read(cx), Drain::Failed | Drain::Skipped) {
+                drain_stopped = true;
             }
 
             // OpenSSL fills the caller's buffer during this synchronous call;
@@ -578,21 +712,21 @@ where
                     if let Err(e) = self.collect_outbound() {
                         return Poll::Ready(Err(e));
                     }
-                    if !drain_failed && self.outbound_len() > 0 {
+                    if !drain_stopped && self.outbound_len() > 0 {
                         match self.drain_for_read(cx) {
                             Drain::Complete => continue,
                             Drain::Pending => {
                                 self.register_read_waiter(cx);
                                 return Poll::Pending;
                             }
-                            Drain::Failed => drain_failed = true,
+                            Drain::Failed | Drain::Skipped => drain_stopped = true,
                         }
                     }
                     // Either there was nothing to send after all, or the write
-                    // side is broken and its error belongs to the writer. Fall
-                    // through: only the peer can move this session now, and
-                    // polling the read side is what gives this task a wake
-                    // source it can trust.
+                    // side is broken or closing and its ciphertext is no longer
+                    // this read's business. Fall through: only the peer can
+                    // move this session now, and polling the read side is what
+                    // gives this task a wake source it can trust.
                 }
                 Progress::NeedsInbound => {
                     // `classify` guarantees the engine owes no flush here, so
@@ -617,6 +751,288 @@ where
             }
         }
     }
+
+    /// Take a transport write error latched by an earlier operation.
+    ///
+    /// Every write-side entry point calls this first, which is what makes a
+    /// deferred failure surface exactly once, on the direction it belongs to.
+    fn take_pending_write_error(&mut self) -> Option<Error> {
+        self.pending_write_error.take()
+    }
+
+    /// Debug-only guard on the rule that makes a readiness write path safe.
+    ///
+    /// Parking with a retry owed would let the next poll present a different
+    /// buffer, which OpenSSL rejects permanently as a "bad write retry" and
+    /// which kills the session rather than stalling it.
+    ///
+    /// Written as a gated block rather than a `debug_assert!` on purpose: the
+    /// predicate exists only where assertions run, and `debug_assert!` would
+    /// still type-check its argument in a build with assertions off.
+    fn debug_assert_no_retry_owed(&self) {
+        #[cfg(debug_assertions)]
+        {
+            assert!(
+                !self.engine.retry_owed(),
+                "poll_write parked while OpenSSL was owed a byte-identical retry"
+            );
+        }
+    }
+
+    /// Latch a terminal write-direction condition and report it once.
+    fn fail_write(&mut self, failure: WriteFailure, error: Error) -> Poll<Result<usize, Error>> {
+        self.write_failure = Some(failure);
+        Poll::Ready(Err(error))
+    }
+
+    /// The write pump.
+    ///
+    /// The admission rule is the whole design: the decision to park is taken
+    /// *before* OpenSSL is entered. A measured `SSL_write_ex` retried with a
+    /// different buffer fails permanently, and tokio's `AsyncWrite` contract
+    /// explicitly allows the next poll to bring one, so "call, then park" is
+    /// not available here. Plaintext is offered only when nothing is queued
+    /// anywhere, which simultaneously bounds buffering and guarantees that a
+    /// pending write consumed nothing.
+    fn poll_write_impl(&mut self, cx: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, Error>> {
+        // Before the empty-slice short circuit, before OpenSSL, and before any
+        // transport poll.
+        if let Err(e) = self.check_handshake_done() {
+            return Poll::Ready(Err(e));
+        }
+        // A transport failure deferred by an earlier best-effort drain belongs
+        // to this direction and is reported before anything else happens.
+        if let Some(e) = self.take_pending_write_error() {
+            return Poll::Ready(Err(e));
+        }
+        if data.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if let Some(failure) = self.write_failure {
+            // Terminal in both cases: OpenSSL is never re-entered on this path.
+            return Poll::Ready(Err(failure.to_error()));
+        }
+
+        // Everything already produced goes out first. Only an empty engine and
+        // an empty backlog make room for a full record, which is what lets the
+        // ceiling be a structural one rather than a running total.
+        if let Err(e) = self.collect_outbound() {
+            return self.fail_write(WriteFailure::Tls, e);
+        }
+        match self.poll_drain_outbound(cx) {
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => {
+                // Prior ciphertext is still queued, so OpenSSL is not entered
+                // at all and the caller's buffer is untouched.
+                self.register_write_waiter(cx);
+                self.debug_assert_no_retry_owed();
+                return Poll::Pending;
+            }
+            Poll::Ready(Ok(())) => {}
+        }
+        debug_assert_eq!(self.outbound_len(), 0);
+        debug_assert_eq!(self.engine.outbound_pending(), 0);
+
+        // One record is all `SSL_write_ex` will take, so offering more only
+        // enlarges the slice OpenSSL would owe a retry for.
+        let offered = &data[..data.len().min(MAX_RECORD)];
+        let mut flush_retried = false;
+
+        loop {
+            let progress = match self.engine.write_plaintext(offered) {
+                Ok(progress) => progress,
+                Err(Error::Closed) => return self.fail_write(WriteFailure::Closed, Error::Closed),
+                Err(e) => return self.fail_write(WriteFailure::Tls, e),
+            };
+
+            match progress {
+                // A non-empty slice that TLS accepted nothing from is the
+                // peer's `close_notify` seen through the write path. OpenSSL is
+                // owed a retry whose length cannot be reconstructed from a
+                // later caller buffer, so the direction ends here rather than
+                // reporting a zero-length success it is not allowed to report.
+                Progress::Done(0) => return self.fail_write(WriteFailure::Closed, Error::Closed),
+                Progress::Done(n) => {
+                    if let Err(e) = self.collect_outbound() {
+                        return self.fail_write(WriteFailure::Tls, e);
+                    }
+                    // Best effort, and deliberately not part of the result: TLS
+                    // has already taken these bytes, so anything but
+                    // `Ready(Ok(n))` would lose them. A transport failure is
+                    // latched for the next write-side call instead of dropped.
+                    match self.poll_drain_outbound(cx) {
+                        Poll::Ready(Ok(())) | Poll::Pending => {}
+                        Poll::Ready(Err(e)) => {
+                            if self.pending_write_error.is_none() {
+                                self.pending_write_error = Some(e);
+                            }
+                        }
+                    }
+                    return Poll::Ready(Ok(n));
+                }
+                Progress::NeedsFlush => {
+                    // Unreachable by construction — the pair was empty and has
+                    // room for four records, while one write emits at most one
+                    // — so this is defensive only. The identical slice is
+                    // retried at most once, and never spins.
+                    if flush_retried {
+                        return self.fail_write(WriteFailure::Tls, Error::tls());
+                    }
+                    flush_retried = true;
+                    if let Err(e) = self.collect_outbound() {
+                        return self.fail_write(WriteFailure::Tls, e);
+                    }
+                }
+                Progress::NeedsInbound => {
+                    // A write that needs to *read* means a peer-initiated
+                    // post-handshake condition — renegotiation or a TLS 1.3
+                    // key update — which M1 does not handle. Parking here would
+                    // park with a retry owed, and staging the caller's
+                    // plaintext would break the cancellation guarantee, so the
+                    // write direction ends instead. Reads keep working, and
+                    // flush and shutdown still deliver what was produced.
+                    return self.fail_write(WriteFailure::Tls, Error::tls());
+                }
+            }
+        }
+    }
+
+    /// The flush pump: the point at which delivery stops being best effort.
+    ///
+    /// Every byte of ciphertext produced so far reaches the transport, and the
+    /// transport itself is flushed, before this reports success.
+    fn poll_flush_impl(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        if let Some(e) = self.take_pending_write_error() {
+            return Poll::Ready(Err(e));
+        }
+
+        // Collecting reads the BIO; it does not re-enter OpenSSL, so it is
+        // still correct — and still required — under a terminal failure.
+        if let Err(e) = self.collect_outbound() {
+            self.write_failure = Some(WriteFailure::Tls);
+            return Poll::Ready(Err(e));
+        }
+        match self.poll_drain_outbound(cx) {
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => {
+                self.register_write_waiter(cx);
+                return Poll::Pending;
+            }
+            Poll::Ready(Ok(())) => {}
+        }
+        match Pin::new(&mut self.transport).poll_flush(cx) {
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::Transport(e))),
+            Poll::Pending => {
+                self.register_write_waiter(cx);
+                return Poll::Pending;
+            }
+            Poll::Ready(Ok(())) => {}
+        }
+
+        // A clean drain under a peer-closed session is a real success: nothing
+        // failed and nothing is outstanding. A fatal TLS condition is not, even
+        // though the ciphertext that existed has been delivered.
+        if self.write_failure == Some(WriteFailure::Tls) {
+            return Poll::Ready(Err(Error::tls()));
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    /// The closure pump.
+    ///
+    /// Generic tokio utilities reach for `shutdown`, so this must not be a way
+    /// to bypass `close_notify` and leave the peer seeing a truncated stream.
+    /// It does not wait for the peer's own notification: a silent peer would
+    /// otherwise hang the caller, and TLS does not require the wait.
+    fn poll_shutdown_impl(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        if let Some(e) = self.take_pending_write_error() {
+            return Poll::Ready(Err(e));
+        }
+
+        loop {
+            match self.shutdown_state {
+                ShutdownState::Open => {
+                    // Application ciphertext goes out before the notification,
+                    // so the peer never sees closure overtake data.
+                    if let Err(e) = self.collect_outbound() {
+                        self.write_failure = Some(WriteFailure::Tls);
+                        return Poll::Ready(Err(e));
+                    }
+                    match self.poll_drain_outbound(cx) {
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => {
+                            self.register_write_waiter(cx);
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Ok(())) => {}
+                    }
+
+                    // A peer-closed session is still allowed to close: the
+                    // engine has not sent its own notification, and withholding
+                    // it would truncate the peer. Only a fatal TLS condition
+                    // forbids re-entering OpenSSL, and it leaves M1 unable to
+                    // synthesize a notification at all.
+                    if self.write_failure != Some(WriteFailure::Tls) {
+                        match self.engine.shutdown() {
+                            Ok(Progress::Done(_)) => {}
+                            // Defensive: the pair was just drained, so a
+                            // `close_notify` cannot fail to fit and the peer is
+                            // never waited on.
+                            Ok(_) => self.write_failure = Some(WriteFailure::Tls),
+                            Err(_) => self.write_failure = Some(WriteFailure::Tls),
+                        }
+                        if let Err(e) = self.collect_outbound() {
+                            self.write_failure = Some(WriteFailure::Tls);
+                            return Poll::Ready(Err(e));
+                        }
+                    }
+                    self.shutdown_state = ShutdownState::TlsClosed;
+                    self.wake_progress(cx);
+                }
+                ShutdownState::TlsClosed => {
+                    match self.poll_drain_outbound(cx) {
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => {
+                            self.register_write_waiter(cx);
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Ok(())) => {}
+                    }
+                    match Pin::new(&mut self.transport).poll_flush(cx) {
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::Transport(e))),
+                        Poll::Pending => {
+                            self.register_write_waiter(cx);
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Ok(())) => {}
+                    }
+                    self.shutdown_state = ShutdownState::TransportFlushed;
+                }
+                ShutdownState::TransportFlushed => {
+                    // Whether this leaves the read half usable is the
+                    // transport's contract, not this crate's.
+                    match Pin::new(&mut self.transport).poll_shutdown(cx) {
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::Transport(e))),
+                        Poll::Pending => {
+                            self.register_write_waiter(cx);
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Ok(())) => {}
+                    }
+                    self.shutdown_state = ShutdownState::Done;
+                }
+                // Closing an already-closed session succeeds without emitting
+                // a second notification, however often it is repeated.
+                ShutdownState::Done => {
+                    return Poll::Ready(if self.write_failure == Some(WriteFailure::Tls) {
+                        Err(Error::tls())
+                    } else {
+                        Ok(())
+                    });
+                }
+            }
+        }
+    }
 }
 
 impl<S> AsyncRead for SslStream<S>
@@ -637,6 +1053,63 @@ where
         // classification beyond `Error::downcast_io`'s reach.
         self.get_mut()
             .poll_read_impl(cx, buf)
+            .map(|result| result.map_err(io::Error::from))
+    }
+}
+
+impl<S> AsyncWrite for SslStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    /// Writes plaintext, reporting what the TLS layer accepted.
+    ///
+    /// A successful return means the bytes are committed to the session and
+    /// their ciphertext is queued; one best-effort attempt is made to hand that
+    /// ciphertext to the transport before returning, so the common
+    /// write-then-read sequence makes progress with no explicit flush. Delivery
+    /// is *guaranteed* only once [`poll_flush`](AsyncWrite::poll_flush) or
+    /// [`poll_shutdown`](AsyncWrite::poll_shutdown) completes. This differs
+    /// from the compio binding, which reports only bytes whose ciphertext has
+    /// reached the transport.
+    ///
+    /// At most one TLS record is accepted per call, so a larger buffer returns
+    /// a partial count. A `Poll::Pending` return has consumed nothing at all,
+    /// which is what makes dropping a write future deliver nothing to the peer.
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        // Converted exactly once: re-wrapping the result would bury the
+        // classification beyond `Error::downcast_io`'s reach.
+        self.get_mut()
+            .poll_write_impl(cx, buf)
+            .map(|result| result.map_err(io::Error::from))
+    }
+
+    /// Delivers every byte of ciphertext produced so far, then flushes the
+    /// transport.
+    ///
+    /// This is the delivery boundary a write does not provide.
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut()
+            .poll_flush_impl(cx)
+            .map(|result| result.map_err(io::Error::from))
+    }
+
+    /// Shuts the TLS session down, not merely the transport.
+    ///
+    /// Queued ciphertext is flushed, one `close_notify` is sent, and the
+    /// transport is flushed and shut down. The peer's own notification is not
+    /// waited for. Repeating this after it has completed succeeds without
+    /// emitting a second notification.
+    ///
+    /// Whether the read half survives is the transport's contract: a transport
+    /// whose shutdown closes only its write direction leaves reads usable until
+    /// the peer closes, and one that closes both does not.
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut()
+            .poll_shutdown_impl(cx)
             .map(|result| result.map_err(io::Error::from))
     }
 }

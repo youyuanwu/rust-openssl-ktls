@@ -43,14 +43,6 @@
 //! [tokio]: https://docs.rs/tokio
 
 #![deny(unsafe_op_in_unsafe_fn)]
-// A `tokio`-only build does not yet reach the whole shared engine: the Tokio
-// adapter currently drives the handshake and read surface, leaving
-// `write_plaintext`, `shutdown`, and `is_locally_closed` without a consumer
-// when compio is deselected. The allowance is scoped to exactly that
-// configuration, so the compio and default builds remain strict, and it is
-// removed once the Tokio adapter drives the engine's write, flush, and shutdown
-// surface.
-#![cfg_attr(all(feature = "tokio", not(feature = "compio")), allow(dead_code))]
 
 mod engine;
 mod error;
