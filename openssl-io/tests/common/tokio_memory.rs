@@ -84,6 +84,14 @@ pub struct Faults {
     /// needs in order to force the stream into a pending write, cancel it, and
     /// then let delivery resume.
     pub write_gate_closed: bool,
+    /// Accept at most this many further bytes in total, then park.
+    ///
+    /// Distinct from `max_write`, which caps a single call but lets the next
+    /// one through. A budget is consumed across calls and, once exhausted,
+    /// behaves exactly like a closed gate. It is what lets a test drive a
+    /// transport that accepts *part* of a record and only then goes pending —
+    /// the case where ciphertext is left stranded mid-write.
+    pub write_budget: Option<usize>,
     /// Fail the next read with this error kind instead of returning data.
     pub read_error: Option<io::ErrorKind>,
     /// Fail the next write with this error kind.
@@ -340,11 +348,23 @@ impl Controls {
     /// The wake is the point of the gate: a writer parked behind it must make
     /// progress without anything else poking the transport.
     pub fn open_write_gate(&self) {
-        self.update(|f| f.write_gate_closed = false);
+        self.update(|f| {
+            f.write_gate_closed = false;
+            f.write_budget = None;
+        });
         let writer = lock(&self.tx).write_waker.take();
         if let Some(waker) = writer {
             waker.wake();
         }
+    }
+
+    /// Accept at most `bytes` further bytes in total, then park as if gated.
+    ///
+    /// Use this to strand ciphertext *mid-record*: the transport takes a
+    /// prefix and only then goes pending, which is the case a closed gate
+    /// cannot produce because it accepts nothing at all.
+    pub fn set_write_budget(&self, bytes: Option<usize>) {
+        self.update(|f| f.write_budget = bytes);
     }
 
     /// Close only the write direction: the peer drains, then sees clean end of
@@ -553,10 +573,14 @@ impl AsyncWrite for MemoryStream {
 
         let (injected, gated, limit) = {
             let mut faults = lock(&this.faults);
+            let budget_spent = faults.write_budget == Some(0);
             (
                 faults.write_error.take(),
-                faults.write_gate_closed,
-                faults.max_write.unwrap_or(usize::MAX),
+                faults.write_gate_closed || budget_spent,
+                faults
+                    .max_write
+                    .unwrap_or(usize::MAX)
+                    .min(faults.write_budget.unwrap_or(usize::MAX)),
             )
         };
 
@@ -597,6 +621,9 @@ impl AsyncWrite for MemoryStream {
 
         if let Some(waker) = peer_reader {
             waker.wake();
+        }
+        if let Some(budget) = lock(&this.faults).write_budget.as_mut() {
+            *budget -= n;
         }
         this.record(Event::Write(n));
         Poll::Ready(Ok(n))

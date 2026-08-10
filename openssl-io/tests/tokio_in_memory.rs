@@ -734,9 +734,11 @@ async fn write_all_then_read_round_trip_without_explicit_flush_when_transport_st
     let reply: Vec<u8> = (0..9_000u32).map(|i| (i % 233) as u8).collect();
 
     client_stats.reset();
-    // The transport takes the write at the TLS layer and then refuses every
-    // byte of the resulting ciphertext.
-    client_controls.close_write_gate();
+    // The transport takes a prefix of the resulting ciphertext and only then
+    // goes pending. A closed gate would accept nothing at all; a budget strands
+    // the record *mid-write*, which is the case FR-011b's second clause is
+    // about — ciphertext already partly on the wire and the rest queued.
+    client_controls.set_write_budget(Some(64));
 
     let expected = request.clone();
     let answer = reply.clone();
@@ -752,10 +754,10 @@ async fn write_all_then_read_round_trip_without_explicit_flush_when_transport_st
         .await
         .expect("the write timed out")
         .expect("a stalled transport must not fail an accepted write");
+    let delivered = client_stats.bytes_written();
     assert_eq!(
-        client_stats.bytes_written(),
-        0,
-        "the stalled transport should have taken nothing"
+        delivered, 64,
+        "the budget should have let exactly a prefix through"
     );
     assert!(
         client_stats.events().contains(&Event::WritePending),
@@ -779,7 +781,11 @@ async fn write_all_then_read_round_trip_without_explicit_flush_when_transport_st
         client_stats.write_polls() > polls_before,
         "the read never attempted the ciphertext its own write left queued"
     );
-    assert_eq!(client_stats.bytes_written(), 0, "the gate is still closed");
+    assert_eq!(
+        client_stats.bytes_written(),
+        delivered,
+        "the budget is still exhausted, so nothing further moved"
+    );
 
     // Reopening wakes whoever holds the transport's write registration. That
     // it is the parked reader is exactly what SC-008a asks for.
