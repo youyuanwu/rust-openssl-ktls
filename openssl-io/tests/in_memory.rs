@@ -437,9 +437,12 @@ async fn into_inner_refuses_while_an_operation_is_in_flight() {
     assert!(pending.is_err(), "read should not have completed");
 
     match client.into_inner() {
-        Err((stream, _)) => {
-            // The stream comes back intact and is still usable.
+        Err((mut stream, _)) => {
+            // The stream comes back intact and remains genuinely usable, not
+            // merely inspectable.
             assert!(stream.cipher().is_some());
+            let BufResult(n, _) = stream.write(b"still works".to_vec()).await;
+            assert_eq!(n.expect("write on the returned stream"), 11);
         }
         Ok(_) => panic!("into_inner must refuse while an operation is in flight"),
     }
@@ -464,6 +467,127 @@ async fn abandoned_read_leaves_the_session_usable() {
     })
     .await;
     assert_eq!(&got, b"still here");
+}
+
+/// Build a pair whose client transport can be stalled on demand, so a write can
+/// be abandoned mid-flight deterministically.
+async fn connected_stallable() -> (Stream, Stream, std::rc::Rc<std::cell::RefCell<Faults>>) {
+    let (c_ssl, s_ssl) = certs::engine_ssl_pair();
+    let (c_tp, s_tp) = duplex();
+    let faults = c_tp.faults();
+    let (cr, cw) = c_tp.into_halves();
+    let (sr, sw) = s_tp.into_halves();
+
+    let mut client = SslStream::new(c_ssl, cr, cw).unwrap();
+    let mut server = SslStream::new(s_ssl, sr, sw).unwrap();
+    let (c, s) = futures_join(client.connect(), server.accept()).await;
+    c.expect("client handshake");
+    s.expect("server handshake");
+    (client, server, faults)
+}
+
+/// Start a write, stall the transport so it cannot complete, then abandon it.
+async fn abandon_a_write(client: &mut Stream, faults: &std::cell::RefCell<Faults>, data: &[u8]) {
+    faults.borrow_mut().stall_writes = true;
+    let abandoned = compio::time::timeout(Duration::from_millis(20), async {
+        let BufResult(r, _) = client.write(data.to_vec()).await;
+        r
+    })
+    .await;
+    assert!(abandoned.is_err(), "write should have stalled");
+    faults.borrow_mut().stall_writes = false;
+}
+
+/// The bug this guards against: resuming an abandoned write must not discard
+/// the ciphertext of the write that follows it. Both payloads must arrive, in
+/// order, with nothing lost.
+#[compio::test]
+async fn abandoned_write_then_write_delivers_both_in_order() {
+    let (mut client, mut server, faults) = connected_stallable().await;
+
+    abandon_a_write(&mut client, &faults, b"FIRST").await;
+
+    let (_, got) = futures_join(write_all(&mut client, b"SECOND"), async {
+        // The abandoned payload may or may not have been committed, so accept
+        // either, but nothing may be corrupted or lost from the second write.
+        let mut got = Vec::new();
+        while !got.ends_with(b"SECOND") {
+            let buf = Vec::with_capacity(1024);
+            let BufResult(n, buf) = server.read(buf).await;
+            let n = n.expect("read after abandoned write");
+            assert!(n > 0, "unexpected eof");
+            got.extend_from_slice(&buf[..n]);
+        }
+        got
+    })
+    .await;
+
+    assert!(
+        got == b"SECOND" || got == b"FIRSTSECOND",
+        "unexpected bytes {:?} -- an abandoned write must be either fully \
+         committed or not at all, never interleaved or truncated",
+        String::from_utf8_lossy(&got)
+    );
+}
+
+#[compio::test]
+async fn abandoned_write_then_read_keeps_the_session_correct() {
+    let (mut client, mut server, faults) = connected_stallable().await;
+
+    abandon_a_write(&mut client, &faults, b"pending payload").await;
+
+    // A read must not resume or clear the staged write; it just works.
+    let (_, got) = futures_join(write_all(&mut server, b"from server"), async {
+        read_exact(&mut client, 11).await
+    })
+    .await;
+    assert_eq!(&got, b"from server");
+}
+
+#[compio::test]
+async fn abandoned_write_then_flush_settles_it() {
+    let (mut client, mut server, faults) = connected_stallable().await;
+
+    abandon_a_write(&mut client, &faults, b"queued").await;
+
+    let (flushed, _) = futures_join(client.flush(), async {
+        let buf = Vec::with_capacity(1024);
+        let _ = server.read(buf).await;
+    })
+    .await;
+    flushed.expect("flush should settle the retained write");
+}
+
+#[compio::test]
+async fn abandoned_write_then_close_still_sends_close_notify() {
+    let (mut client, mut server, faults) = connected_stallable().await;
+
+    abandon_a_write(&mut client, &faults, b"queued").await;
+
+    let (closed, _) = futures_join(client.close(), async {
+        // Drain until the peer observes the orderly end.
+        for _ in 0..8 {
+            let buf = Vec::with_capacity(4096);
+            let BufResult(n, _) = server.read(buf).await;
+            if matches!(n, Ok(0)) {
+                break;
+            }
+        }
+    })
+    .await;
+    closed.expect("close should settle the retained write and notify");
+    assert!(
+        server.is_peer_closed(),
+        "close_notify must still reach the peer after an abandoned write"
+    );
+}
+
+#[compio::test]
+async fn dropping_with_an_operation_in_flight_neither_panics_nor_blocks() {
+    let (mut client, _server, faults) = connected_stallable().await;
+    abandon_a_write(&mut client, &faults, b"in flight").await;
+    // The retained write operation is dropped along with the stream.
+    drop(client);
 }
 
 #[compio::test]

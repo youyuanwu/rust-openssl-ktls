@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
+use std::task::Poll;
 
 use compio_buf::{BufResult, IoBuf, IoBufMut};
 use compio_io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -51,6 +52,11 @@ pub struct SslStream<R, W> {
     /// A retained transport write, likewise.
     write_op: Option<WriteOp<W>>,
 
+    /// Ciphertext drained from the engine but not yet handed to a transport
+    /// write. Keeping it here means a retained write operation is never
+    /// overtaken or discarded when more ciphertext appears.
+    outbound: Vec<u8>,
+
     /// Ciphertext received but not yet accepted by OpenSSL. The BIO pair is
     /// bounded, so `put_inbound` can take less than offered and the remainder
     /// must be held here rather than dropped.
@@ -75,6 +81,7 @@ where
             write_half: Some(write_half),
             read_op: None,
             write_op: None,
+            outbound: Vec::new(),
             inbound: Vec::new(),
             stage: Vec::with_capacity(MAX_RECORD),
         })
@@ -97,7 +104,7 @@ where
                 && !self.engine.is_handshaking()
             {
                 // Emit anything the final step produced before returning.
-                self.pump_outbound().await?;
+                self.flush_outbound().await?;
                 return Ok(());
             }
             self.serve(progress).await?;
@@ -117,7 +124,7 @@ where
             let progress = self.engine.shutdown()?;
             match progress {
                 Progress::Done(_) => {
-                    self.pump_outbound().await?;
+                    self.flush_outbound().await?;
                     return Ok(());
                 }
                 _ => self.serve(progress).await?,
@@ -151,6 +158,7 @@ where
                         write_half,
                         read_op: None,
                         write_op: None,
+                        outbound: self.outbound,
                         inbound: self.inbound,
                         stage: self.stage,
                     },
@@ -193,19 +201,23 @@ where
     async fn serve(&mut self, progress: Progress) -> Result<(), Error> {
         match progress {
             Progress::Done(_) => Ok(()),
-            Progress::NeedsFlush => self.pump_outbound().await,
+            Progress::NeedsFlush => self.flush_outbound().await,
             Progress::NeedsInbound => {
-                // Outbound always goes first: OpenSSL reports "want read" while
-                // its own records are still queued, and waiting for the peer
-                // without sending those deadlocks the connection.
-                self.pump_outbound().await?;
+                // Records OpenSSL has already produced must be on their way
+                // before we wait on the peer, or a handshake deadlocks with our
+                // own bytes still queued. But we deliberately do not wait for
+                // that write to *complete*: if the peer is blocked writing to
+                // us, it will not drain until we read, and waiting here would
+                // deadlock both sides. Submitting and moving on lets the stored
+                // write make progress while inbound is driven.
+                self.submit_outbound().await?;
                 self.pump_inbound().await
             }
         }
     }
 
-    /// Move every queued byte of ciphertext to the transport.
-    async fn pump_outbound(&mut self) -> Result<(), Error> {
+    /// Drain ciphertext out of the engine into the backlog.
+    fn collect_outbound(&mut self) {
         while self.engine.outbound_pending() > 0 {
             let mut buf = vec![0u8; CIPHER_CHUNK];
             let n = self.engine.take_outbound(&mut buf);
@@ -213,9 +225,73 @@ where
                 break;
             }
             buf.truncate(n);
-            self.transport_write(buf).await?;
+            self.outbound.append(&mut buf);
+        }
+    }
+
+    /// Begin writing the backlog if nothing is already in flight.
+    fn start_write_op(&mut self) -> Result<(), Error> {
+        if self.write_op.is_some() || self.outbound.is_empty() {
+            return Ok(());
+        }
+        let buf = std::mem::take(&mut self.outbound);
+        let half = self
+            .write_half
+            .take()
+            .ok_or_else(|| Error::Transport(std::io::Error::other("write half in use")))?;
+        self.write_op = Some(Box::pin(async move {
+            let mut half = half;
+            let res = half.write_all(buf).await;
+            (half, res)
+        }));
+        Ok(())
+    }
+
+    /// Poll a stored write once, settling it only if it is already done.
+    async fn advance_write_op(&mut self) -> Result<(), Error> {
+        let Some(op) = self.write_op.as_mut() else {
+            return Ok(());
+        };
+        let polled = std::future::poll_fn(|cx| Poll::Ready(op.as_mut().poll(cx))).await;
+        if let Poll::Ready((half, BufResult(res, _))) = polled {
+            self.write_op = None;
+            self.write_half = Some(half);
+            res.map_err(Error::Transport)?;
         }
         Ok(())
+    }
+
+    /// Wait for a stored write to finish.
+    async fn settle_write_op(&mut self) -> Result<(), Error> {
+        let Some(op) = self.write_op.as_mut() else {
+            return Ok(());
+        };
+        let (half, BufResult(res, _)) = std::future::poll_fn(|cx| op.as_mut().poll(cx)).await;
+        self.write_op = None;
+        self.write_half = Some(half);
+        res.map_err(Error::Transport)
+    }
+
+    /// Hand ciphertext to the transport without waiting for delivery.
+    async fn submit_outbound(&mut self) -> Result<(), Error> {
+        self.advance_write_op().await?;
+        self.collect_outbound();
+        self.start_write_op()?;
+        self.advance_write_op().await
+    }
+
+    /// Wait until every byte of ciphertext produced so far has been delivered.
+    async fn flush_outbound(&mut self) -> Result<(), Error> {
+        loop {
+            // Finish whatever is in flight first, so a retained operation from
+            // an abandoned future is never overtaken or discarded.
+            self.settle_write_op().await?;
+            self.collect_outbound();
+            if self.outbound.is_empty() {
+                return Ok(());
+            }
+            self.start_write_op()?;
+        }
     }
 
     /// Obtain more ciphertext and offer it to OpenSSL.
@@ -240,28 +316,6 @@ where
             self.inbound.extend_from_slice(&data[accepted..]);
         }
         Ok(())
-    }
-
-    /// Drive the stored transport write to completion, creating it if needed.
-    async fn transport_write(&mut self, buf: Vec<u8>) -> Result<(), Error> {
-        if self.write_op.is_none() {
-            let half = self
-                .write_half
-                .take()
-                .ok_or_else(|| Error::Transport(std::io::Error::other("write half in use")))?;
-            self.write_op = Some(Box::pin(async move {
-                let mut half = half;
-                let res = half.write_all(buf).await;
-                (half, res)
-            }));
-        }
-
-        let op = self.write_op.as_mut().expect("just populated");
-        let (half, BufResult(res, _)) = std::future::poll_fn(|cx| op.as_mut().poll(cx)).await;
-
-        self.write_op = None;
-        self.write_half = Some(half);
-        res.map_err(Error::Transport)
     }
 
     /// Drive the stored transport read to completion, creating it if needed.
@@ -310,7 +364,7 @@ where
             match progress {
                 Progress::Done(_) => {
                     self.stage.clear();
-                    self.pump_outbound().await?;
+                    self.flush_outbound().await?;
                 }
                 other => self.serve(other).await?,
             }
@@ -345,7 +399,7 @@ where
                     self.stage.clear();
                     // Only report bytes whose ciphertext has actually reached
                     // the transport.
-                    self.pump_outbound().await?;
+                    self.flush_outbound().await?;
                     return Ok(n);
                 }
                 other => self.serve(other).await?,
@@ -428,7 +482,7 @@ where
         self.finish_staged_write()
             .await
             .map_err(std::io::Error::from)?;
-        self.pump_outbound().await.map_err(std::io::Error::from)?;
+        self.flush_outbound().await.map_err(std::io::Error::from)?;
         if let Some(half) = self.write_half.as_mut() {
             half.flush().await?;
         }
