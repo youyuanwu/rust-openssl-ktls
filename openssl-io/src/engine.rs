@@ -30,6 +30,13 @@ const PAIR_BUF: usize = 4 * MAX_RECORD;
 /// `SSL_write_ex` call. Measured, not assumed — see `docs/CompioStream.md`.
 pub(crate) const MAX_RECORD: usize = 16384;
 
+/// Size of the crate-owned ciphertext buffers moved to and from the transport.
+///
+/// It lives here, beside [`MAX_RECORD`], rather than in a runtime adapter,
+/// because every adapter stages ciphertext and none should have to depend on
+/// another runtime's feature-gated module to learn how much to stage.
+pub(crate) const CIPHER_CHUNK: usize = 16 * 1024;
+
 /// Which side of the handshake to drive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Role {

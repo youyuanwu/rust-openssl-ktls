@@ -13,7 +13,8 @@ use common::certs;
 use common::memory::{Faults, MemoryReadHalf, MemoryWriteHalf, duplex};
 use compio_buf::BufResult;
 use compio_io::{AsyncRead, AsyncWrite};
-use openssl_io::{Error, SslStream};
+use openssl_io::Error;
+use openssl_io::compio::SslStream;
 
 type Stream = SslStream<MemoryReadHalf, MemoryWriteHalf>;
 

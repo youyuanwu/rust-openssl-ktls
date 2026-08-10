@@ -59,6 +59,62 @@ jobs:
     - name: Run cargo test
       run: cargo +${{ matrix.rust }} test --locked --all -- --nocapture
 
+    - name: Build openssl-io with only the compio feature
+      run: cargo +${{ matrix.rust }} build --locked -p openssl-io --no-default-features --features compio
+
+    - name: Build openssl-io with only the tokio feature
+      run: cargo +${{ matrix.rust }} build --locked -p openssl-io --no-default-features --features tokio
+
+    - name: Test openssl-io with only the compio feature
+      run: cargo +${{ matrix.rust }} test --locked -p openssl-io --no-default-features --features compio
+
+    - name: Test openssl-io with only the tokio feature
+      run: cargo +${{ matrix.rust }} test --locked -p openssl-io --no-default-features --features tokio
+
+    - name: Clippy openssl-io with only the compio feature
+      run: cargo +${{ matrix.rust }} clippy --locked -p openssl-io --all-targets --no-default-features --features compio -- -D warnings
+
+    - name: Clippy openssl-io with only the tokio feature
+      run: cargo +${{ matrix.rust }} clippy --locked -p openssl-io --all-targets --no-default-features --features tokio -- -D warnings
+
+    # SC-020: each single-feature *normal* dependency graph must exclude the
+    # runtime that was not selected, and the default graph must contain both.
+    # Dev-dependencies are deliberately not consulted; Cargo cannot gate them,
+    # so `-e normal` is the only honest gate.
+    - name: Assert single-feature dependency graphs
+      run: |
+        set -euo pipefail
+
+        # `set -e` does not abort on a failing `! cmd`, so a negative assertion
+        # has to test and exit explicitly or it silently passes.
+        require() {
+          grep -qE "$2" <<<"$3" || { echo "::error::$1: expected /$2/"; exit 1; }
+        }
+        refute() {
+          if grep -qE "$2" <<<"$3"; then echo "::error::$1: unexpected /$2/"; exit 1; fi
+        }
+
+        tokio_tree="$(cargo +${{ matrix.rust }} tree -p openssl-io --locked --no-default-features --features tokio -e normal --prefix none)"
+        require "tokio-only graph" '^tokio v' "$tokio_tree"
+        refute  "tokio-only graph" '^compio(-io|-buf)? v' "$tokio_tree"
+
+        compio_tree="$(cargo +${{ matrix.rust }} tree -p openssl-io --locked --no-default-features --features compio -e normal --prefix none)"
+        require "compio-only graph" '^compio(-io|-buf)? v' "$compio_tree"
+        refute  "compio-only graph" '^tokio v' "$compio_tree"
+
+        default_tree="$(cargo +${{ matrix.rust }} tree -p openssl-io --locked -e normal --prefix none)"
+        require "default graph" '^tokio v' "$default_tree"
+        require "default graph" '^compio(-io|-buf)? v' "$default_tree"
+
+    # SC-022: the engine is the shared, runtime-neutral state machine. It must
+    # name no runtime, no async construct, and no build-time conditional
+    # selecting between runtimes. Comment lines are excluded, since the prose
+    # legitimately discusses both bindings.
+    - name: Assert the TLS engine stays runtime-free
+      run: |
+        set -euo pipefail
+        test -z "$(awk '!/^[[:space:]]*\/\// && /compio|tokio|async|await|futures|Poll|runtime|cfg\(feature/' openssl-io/src/engine.rs)"
+
     - name: Run llvm-cov
       run: cargo +${{ matrix.rust }} llvm-cov --locked --codecov --output-path codecov.json --ignore-filename-regex openssl-ktls-tests.*
 
