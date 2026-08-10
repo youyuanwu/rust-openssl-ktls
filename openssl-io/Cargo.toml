@@ -77,3 +77,8 @@ required-features = ["tokio"]
 name = "tokio_in_memory"
 path = "tests/tokio_in_memory.rs"
 required-features = ["tokio"]
+
+[[test]]
+name = "tokio_wakers"
+path = "tests/tokio_wakers.rs"
+required-features = ["tokio"]

@@ -1,16 +1,22 @@
 //! End-to-end tests for the tokio stream over the deterministic in-memory
 //! transport.
 //!
-//! This target covers what the adapter's first half implements: construction,
-//! the two explicit handshakes, session inspection, the pre-handshake guard,
-//! and the read pump. The write half arrives in a later phase, so the read
-//! tests take their plaintext from an independently implemented peer —
-//! `tokio-openssl` — rather than from this crate talking to itself. That is
-//! test scaffolding for reviewability, not the two-role interoperability
-//! assertion, which needs both halves of this stream.
+//! This target covers the whole adapter apart from the directional waker
+//! schedules, which live in `tokio_wakers.rs`: construction, the two explicit
+//! handshakes, session inspection, the pre-handshake guard, the read and write
+//! pumps, flush, closure, cancellation, transport recovery, and the fault
+//! matrix — fragmented reads, truncated writes, a transport that accepts
+//! nothing, injected read and write failures, truncation without
+//! `close_notify`, and corrupted ciphertext.
+//!
+//! Some of the read tests take their plaintext from an independently
+//! implemented peer — `tokio-openssl` — rather than from this crate talking to
+//! itself. That is test scaffolding for reviewability, not the two-role
+//! interoperability assertion, which lives in the external-boundary target.
 //!
 //! Every test that can park runs under a bounded timeout, so a lost wakeup
-//! fails the suite instead of hanging it.
+//! fails the suite instead of hanging it. The timeout is a failure detector
+//! only: nothing here is synchronised by waiting.
 
 mod common;
 
@@ -43,6 +49,7 @@ struct Pair {
     client_stats: StatsHandle,
     server_stats: StatsHandle,
     client_controls: Controls,
+    server_controls: Controls,
 }
 
 /// Build a connected, handshaken pair over memory.
@@ -54,6 +61,7 @@ async fn connected() -> Pair {
     let client_stats = c_tp.stats();
     let server_stats = s_tp.stats();
     let client_controls = c_tp.controls();
+    let server_controls = s_tp.controls();
 
     let mut client = SslStream::new(c_ssl, c_tp).unwrap();
     let mut server = SslStream::new(s_ssl, s_tp).unwrap();
@@ -72,6 +80,7 @@ async fn connected() -> Pair {
         client_stats,
         server_stats,
         client_controls,
+        server_controls,
     }
 }
 
@@ -302,6 +311,13 @@ async fn inspection_reaches_the_negotiated_session() {
     assert_eq!(
         pair.server.with_ssl(|ssl| ssl.version_str()),
         pair.client.version()
+    );
+    // SC-016: both sides must report the same negotiated parameters, not merely
+    // report something.
+    assert_eq!(
+        pair.server.cipher(),
+        cipher,
+        "the peers disagree about the negotiated cipher"
     );
 }
 
@@ -1124,4 +1140,649 @@ async fn a_write_reports_acceptance_and_defers_a_transport_failure_to_the_next_c
     })
     .await
     .expect("the retry timed out");
+}
+
+// --- deterministic fault injection ------------------------------------------
+
+/// The per-record overhead one TLS 1.3 application-data record adds to its
+/// plaintext: a five-byte header, the inner content type, and the AEAD tag.
+/// Measured rather than assumed — it is exactly the difference between one full
+/// record's plaintext and its ciphertext.
+const RECORD_OVERHEAD: usize = ONE_RECORD_CIPHERTEXT - MAX_RECORD;
+
+/// Drive both futures but return as soon as `a` resolves.
+///
+/// Needed whenever one side is expected to fail: the peer would otherwise wait
+/// forever for a flight that is never coming, and joining would hang instead of
+/// reporting the failure under test.
+async fn drive_until<A, B>(a: A, b: B) -> A::Output
+where
+    A: Future,
+    B: Future,
+{
+    let mut a = Box::pin(a);
+    let mut b = Box::pin(b);
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(value) = a.as_mut().poll(cx) {
+            return Poll::Ready(value);
+        }
+        // The peer is driven only to keep the exchange moving; whatever it
+        // returns is not this helper's result.
+        let _ = b.as_mut().poll(cx);
+        Poll::Pending
+    })
+    .await
+}
+
+/// SC-024: ciphertext arriving in fragments far below a record must never look
+/// like end of stream, and must reassemble byte for byte.
+#[tokio::test]
+async fn reads_fragmented_below_a_record_deliver_intact_plaintext() {
+    let pair = connected().await;
+    let Pair {
+        mut client,
+        mut server,
+        client_stats,
+        client_controls,
+        ..
+    } = pair;
+
+    let payload: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+    client_stats.reset();
+    client_controls.set_max_read(Some(3));
+
+    timeout(LIMIT, async {
+        server.write_all(&payload).await.unwrap();
+        server.flush().await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        client.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, payload, "fragmented delivery corrupted the plaintext");
+    })
+    .await
+    .expect("the fragmented exchange timed out");
+
+    let events = client_stats.events();
+    assert!(
+        events
+            .iter()
+            .all(|e| !matches!(e, Event::Read(n) if *n > 3)),
+        "the cap was not applied, so nothing was actually fragmented"
+    );
+    assert!(
+        delivering_reads(&events).len() > payload.len() / 3,
+        "expected the record to arrive in thousands of pieces, got {} reads",
+        delivering_reads(&events).len()
+    );
+    assert!(
+        !events.contains(&Event::ReadEof),
+        "a fragment was mistaken for end of stream: {events:?}"
+    );
+}
+
+/// SC-024: a transport that accepts only a few bytes per call must not lose
+/// ciphertext or report a plaintext count the session did not accept.
+#[tokio::test]
+async fn transport_writes_truncated_to_a_few_bytes_still_deliver_every_record() {
+    let pair = connected().await;
+    let Pair {
+        mut client,
+        mut server,
+        client_stats,
+        client_controls,
+        ..
+    } = pair;
+
+    let payload: Vec<u8> = (0..20_000u32).map(|i| (i % 241) as u8).collect();
+    client_stats.reset();
+    client_controls.set_max_write(Some(5));
+
+    timeout(LIMIT, async {
+        client.write_all(&payload).await.unwrap();
+        client.flush().await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        server.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, payload, "short transport writes corrupted the stream");
+    })
+    .await
+    .expect("the short-write exchange timed out");
+
+    let events = client_stats.events();
+    assert!(
+        events
+            .iter()
+            .all(|e| !matches!(e, Event::Write(n) if *n > 5)),
+        "the cap was not applied, so nothing was actually truncated"
+    );
+    assert!(
+        events.iter().filter(|e| e.delivered_bytes()).count() > payload.len() / 5,
+        "expected the ciphertext to be handed over five bytes at a time"
+    );
+    assert_eq!(
+        client_stats.bytes_written(),
+        payload.len() + 2 * RECORD_OVERHEAD,
+        "two records' worth of ciphertext should have reached the peer"
+    );
+}
+
+// --- error classification ---------------------------------------------------
+
+/// SC-012's first classification: ciphertext the record layer cannot
+/// authenticate is a TLS protocol failure.
+async fn provoke_tls_protocol_failure() -> io::Error {
+    let pair = connected().await;
+    let Pair {
+        mut client,
+        server: _server,
+        client_controls,
+        ..
+    } = pair;
+
+    // A well-formed application-data header over nonsense: the framing is
+    // accepted and the AEAD check then fails.
+    let mut record = vec![0x17, 0x03, 0x03, 0x00, 0x20];
+    record.extend_from_slice(&[0x5Au8; 0x20]);
+    client_controls.inject_inbound(&record);
+
+    let mut buf = [0u8; 64];
+    timeout(LIMIT, client.read(&mut buf))
+        .await
+        .expect("the read timed out")
+        .expect_err("corrupted ciphertext must not read as plaintext")
+}
+
+/// SC-012's second classification, and SC-013: a certificate the client has no
+/// reason to trust.
+async fn provoke_verification_failure() -> io::Error {
+    let (c_ssl, s_ssl) = certs::untrusted_ssl_pair();
+    let (c_tp, s_tp) = duplex();
+    let mut client = SslStream::new(c_ssl, c_tp).unwrap();
+    let mut server = SslStream::new(s_ssl, s_tp).unwrap();
+
+    let err = timeout(LIMIT, drive_until(client.connect(), server.accept()))
+        .await
+        .expect("the handshake timed out")
+        .expect_err("an untrusted certificate must fail the handshake");
+    // Converted exactly once, as the trait boundary would convert it.
+    io::Error::from(err)
+}
+
+/// SC-012's third classification: the transport itself fails.
+async fn provoke_transport_failure() -> io::Error {
+    let mut pair = connected().await;
+    pair.client_controls
+        .inject_read_error(io::ErrorKind::ConnectionReset);
+
+    let mut buf = [0u8; 64];
+    timeout(LIMIT, pair.client.read(&mut buf))
+        .await
+        .expect("the read timed out")
+        .expect_err("a failing transport must surface as an error")
+}
+
+/// SC-012's fourth classification: the transport ends with no `close_notify`.
+async fn provoke_unexpected_eof() -> io::Error {
+    let pair = connected().await;
+    let Pair {
+        mut client,
+        server,
+        server_controls,
+        ..
+    } = pair;
+
+    // The peer's transport dies underneath an intact TLS session.
+    drop(server.into_inner().map_err(|_| ()).expect("an idle stream"));
+    assert!(server_controls.write_closed());
+
+    let mut buf = [0u8; 64];
+    timeout(LIMIT, client.read(&mut buf))
+        .await
+        .expect("the read timed out")
+        .expect_err("truncation must not read as a clean close")
+}
+
+/// SC-012's fifth classification: the session is finished.
+async fn provoke_closed_session() -> io::Error {
+    let pair = connected().await;
+    let Pair {
+        mut client,
+        server: _server,
+        ..
+    } = pair;
+
+    timeout(LIMIT, client.shutdown())
+        .await
+        .expect("the shutdown timed out")
+        .unwrap();
+    timeout(LIMIT, client.write(b"too late"))
+        .await
+        .expect("the write timed out")
+        .expect_err("a write after closure must fail")
+}
+
+/// The caller-sequencing marker, which is deliberately *not* one of the five.
+async fn provoke_handshake_required() -> io::Error {
+    let (c_ssl, _s_ssl) = certs::engine_ssl_pair();
+    let (c_tp, _s_tp) = duplex();
+    let mut client = SslStream::new(c_ssl, c_tp).unwrap();
+    let mut buf = [0u8; 16];
+    client
+        .read(&mut buf)
+        .await
+        .expect_err("a read before the handshake must fail")
+}
+
+/// SC-012 / FR-023: every operational classification is provoked through the
+/// tokio stream and recovered from the returned `std::io::Error` by value.
+///
+/// Nothing here inspects a message: the point of the crate's public recovery
+/// route is that text never has to be parsed. The caller-sequencing marker is
+/// carried through the same route and shown to be distinct from all five.
+#[tokio::test]
+async fn every_operational_classification_is_recovered_by_value() {
+    let tls = provoke_tls_protocol_failure().await;
+    assert!(
+        matches!(Error::downcast_io(&tls), Some(Error::Tls(_))),
+        "corrupted ciphertext was not classified as a TLS failure"
+    );
+    assert_eq!(tls.kind(), io::ErrorKind::InvalidData);
+
+    let verification = provoke_verification_failure().await;
+    assert!(
+        matches!(
+            Error::downcast_io(&verification),
+            Some(Error::Verification { .. })
+        ),
+        "an untrusted certificate was not classified as a verification failure"
+    );
+
+    let transport = provoke_transport_failure().await;
+    assert!(
+        matches!(Error::downcast_io(&transport), Some(Error::Transport(_))),
+        "a transport failure was not classified as one"
+    );
+
+    let truncated = provoke_unexpected_eof().await;
+    assert!(
+        matches!(Error::downcast_io(&truncated), Some(Error::UnexpectedEof)),
+        "truncation was not classified as an unexpected end of transport"
+    );
+    assert_eq!(truncated.kind(), io::ErrorKind::UnexpectedEof);
+
+    let closed = provoke_closed_session().await;
+    assert!(
+        matches!(Error::downcast_io(&closed), Some(Error::Closed)),
+        "a closed session was not classified as one"
+    );
+    assert_eq!(closed.kind(), io::ErrorKind::NotConnected);
+
+    // All five are operational, and none of them is the sequencing marker.
+    for (name, err) in [
+        ("tls", &tls),
+        ("verification", &verification),
+        ("transport", &transport),
+        ("unexpected eof", &truncated),
+        ("closed", &closed),
+    ] {
+        assert!(
+            matches!(
+                Error::downcast_io(err),
+                Some(
+                    Error::Tls(_)
+                        | Error::Verification { .. }
+                        | Error::Transport(_)
+                        | Error::UnexpectedEof
+                        | Error::Closed
+                )
+            ),
+            "{name} is not an operational classification"
+        );
+        assert!(
+            !matches!(Error::downcast_io(err), Some(Error::HandshakeRequired)),
+            "{name} collided with the caller-sequencing marker"
+        );
+    }
+
+    // And the marker is neither of them.
+    let marker = provoke_handshake_required().await;
+    assert!(matches!(
+        Error::downcast_io(&marker),
+        Some(Error::HandshakeRequired)
+    ));
+    assert!(
+        !matches!(
+            Error::downcast_io(&marker),
+            Some(
+                Error::Tls(_)
+                    | Error::Verification { .. }
+                    | Error::Transport(_)
+                    | Error::UnexpectedEof
+                    | Error::Closed
+            )
+        ),
+        "the caller-sequencing marker was reported as an operational failure"
+    );
+}
+
+/// SC-013 on its own, because it is the one classification that can only be
+/// provoked during the handshake: the verify result is carried by value, so the
+/// specific reason is available without string matching.
+#[tokio::test]
+async fn an_untrusted_certificate_fails_the_handshake_by_value() {
+    let err = provoke_verification_failure().await;
+    let Some(Error::Verification { code, .. }) = Error::downcast_io(&err) else {
+        panic!("expected a verification failure, got {err:?}");
+    };
+    assert_ne!(
+        *code, 0,
+        "the verify result should name the reason the chain was rejected"
+    );
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+}
+
+/// SC-014's third clause: truncation and a clean end of stream are different
+/// outcomes, asserted side by side so neither can drift into the other.
+#[tokio::test]
+async fn truncation_is_distinct_from_a_clean_end_of_stream() {
+    // Clean: the peer sends `close_notify`, and every later read agrees.
+    let pair = connected().await;
+    let Pair {
+        mut client,
+        mut server,
+        ..
+    } = pair;
+    timeout(LIMIT, server.shutdown())
+        .await
+        .expect("the peer's shutdown timed out")
+        .unwrap();
+
+    let mut buf = [0u8; 64];
+    for attempt in 0..2 {
+        let n = timeout(LIMIT, client.read(&mut buf))
+            .await
+            .expect("the read timed out")
+            .unwrap_or_else(|e| panic!("attempt {attempt} reported an error: {e:?}"));
+        assert_eq!(n, 0, "attempt {attempt} should report end of stream");
+    }
+    assert!(client.is_peer_closed());
+
+    // Truncated: the transport ends with no notification at all.
+    let err = provoke_unexpected_eof().await;
+    assert!(
+        matches!(Error::downcast_io(&err), Some(Error::UnexpectedEof)),
+        "a truncated transport must not read as a clean close"
+    );
+    assert_ne!(
+        err.kind(),
+        io::ErrorKind::NotConnected,
+        "truncation must not be reported as an orderly closure"
+    );
+}
+
+// --- cancellation -----------------------------------------------------------
+
+/// SC-006 / FR-013: a pending write is cancelled, and not one byte of the
+/// plaintext it was carrying reaches the peer.
+///
+/// Each call is tagged with its own byte value, so the recovered plaintext
+/// names exactly which calls survived. The ciphertext queued for the peer is
+/// checked too, and by exact length: the cancelled call never entered OpenSSL,
+/// so it can have produced no record at all — an inequality would also pass if
+/// a stray record had been produced and then dropped somewhere.
+#[tokio::test]
+async fn a_cancelled_pending_write_delivers_none_of_its_own_plaintext() {
+    const TAGGED: usize = 4_096;
+
+    let pair = connected().await;
+    let Pair {
+        mut client,
+        mut server,
+        client_stats,
+        client_controls,
+        ..
+    } = pair;
+
+    client_stats.reset();
+    client_controls.close_write_gate();
+
+    let (_idle, waker) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut accepted: Vec<u8> = Vec::new();
+    let mut cancelled_tag = None;
+
+    // Issue uniquely tagged single-call writes until bounded buffering forces
+    // one to park. That one is dropped where it stands.
+    for i in 0..8u8 {
+        let tag = 0xA0 | i;
+        let payload = vec![tag; TAGGED];
+        let mut write = Box::pin(client.write(&payload));
+        let polled = write.as_mut().poll(&mut cx);
+        match polled {
+            Poll::Ready(result) => {
+                let n = result.expect("a gated transport must not fail an accepted write");
+                assert_eq!(n, TAGGED, "the whole tagged payload should be admitted");
+                accepted.extend(std::iter::repeat_n(tag, n));
+            }
+            Poll::Pending => {
+                drop(write);
+                cancelled_tag = Some(tag);
+                break;
+            }
+        }
+    }
+
+    let cancelled_tag = cancelled_tag.expect("bounded buffering never forced a write to park");
+    let records = accepted.len() / TAGGED;
+    assert!(records >= 1, "no write was admitted, so nothing is proven");
+    assert_eq!(
+        client_stats.bytes_written(),
+        0,
+        "the gate let ciphertext through, so the flush below proves nothing"
+    );
+
+    // Reopen and flush: this is the delivery boundary, so everything the
+    // surviving writes produced is now on the wire and nothing else can be.
+    client_controls.open_write_gate();
+    timeout(LIMIT, client.flush())
+        .await
+        .expect("the flush timed out")
+        .unwrap();
+
+    let on_the_wire = client_controls.peek_queued_for_peer();
+    assert_eq!(
+        on_the_wire.len(),
+        records * (TAGGED + RECORD_OVERHEAD),
+        "the wire carries something other than exactly the accepted writes"
+    );
+
+    let mut got = vec![0u8; accepted.len()];
+    timeout(LIMIT, server.read_exact(&mut got))
+        .await
+        .expect("the read timed out")
+        .unwrap();
+    assert_eq!(
+        got, accepted,
+        "the peer did not receive the accepted writes"
+    );
+    assert!(
+        !got.contains(&cancelled_tag),
+        "a byte of the cancelled write reached the peer"
+    );
+    assert_eq!(
+        client_controls.queued_for_peer(),
+        0,
+        "ciphertext beyond the accepted writes was left on the wire"
+    );
+
+    // And the session is still correct afterwards, in both directions.
+    timeout(LIMIT, async {
+        assert_eq!(
+            round_trip(&mut client, &mut server, b"the session survived").await,
+            b"the session survived".to_vec()
+        );
+        assert_eq!(
+            round_trip(&mut server, &mut client, b"and so does the reply").await,
+            b"and so does the reply".to_vec()
+        );
+    })
+    .await
+    .expect("the follow-up exchange timed out");
+}
+
+/// SC-007 / FR-013a: a cancelled read loses nothing, repeatedly.
+///
+/// The repetition is not padding: a stale waiter or a half-updated buffer
+/// offset only shows up once the same state has been reused, and each round
+/// checks the peer's bytes arrive in order with nothing dropped in between.
+#[tokio::test]
+async fn a_cancelled_pending_read_loses_no_plaintext() {
+    let pair = connected().await;
+    let Pair {
+        mut client,
+        mut server,
+        ..
+    } = pair;
+
+    let mut expected: Vec<u8> = Vec::new();
+    let mut received: Vec<u8> = Vec::new();
+
+    timeout(LIMIT, async {
+        for round in 0..4u8 {
+            // Park a read on a transport with nothing to give, then abandon it.
+            let (counter, waker) = counting_waker();
+            let mut buf = [0xEEu8; 64];
+            {
+                let mut read = Box::pin(client.read(&mut buf));
+                let polled = read.as_mut().poll(&mut Context::from_waker(&waker));
+                assert!(
+                    polled.is_pending(),
+                    "round {round}: nothing has arrived, so the read must park"
+                );
+            }
+            assert_eq!(
+                counter.0.load(Ordering::SeqCst),
+                0,
+                "round {round}: parking must not wake immediately"
+            );
+            assert_eq!(
+                buf, [0xEEu8; 64],
+                "round {round}: a pending read wrote into the caller's buffer"
+            );
+
+            let chunk = vec![0x10 + round; 100];
+            server.write_all(&chunk).await.unwrap();
+            server.flush().await.unwrap();
+            expected.extend_from_slice(&chunk);
+
+            let mut got = vec![0u8; chunk.len()];
+            client.read_exact(&mut got).await.unwrap();
+            received.extend_from_slice(&got);
+        }
+    })
+    .await
+    .expect("the cancellation rounds timed out");
+
+    assert_eq!(
+        received, expected,
+        "cancelled reads lost or reordered the peer's plaintext"
+    );
+}
+
+// --- closure, drop, and the usable read half --------------------------------
+
+/// SC-010 / FR-018 over memory: this transport's shutdown closes only its write
+/// direction, so shutting the stream's write side down must leave reads working
+/// right up until the peer closes.
+#[tokio::test]
+async fn a_half_shutdown_stream_keeps_reading_until_the_peer_closes() {
+    let pair = connected().await;
+    let Pair {
+        mut client,
+        mut server,
+        client_controls,
+        ..
+    } = pair;
+
+    timeout(LIMIT, async {
+        client.shutdown().await.unwrap();
+        assert!(
+            client_controls.write_closed(),
+            "the transport's write direction should be closed"
+        );
+
+        // The peer has not closed, so the read half is still live.
+        server
+            .write_all(b"a reply after the local close")
+            .await
+            .unwrap();
+        server.flush().await.unwrap();
+
+        let mut buf = [0u8; 64];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"a reply after the local close");
+
+        // Only the peer's own closure ends it, and it stays ended.
+        server.shutdown().await.unwrap();
+        for attempt in 0..2 {
+            let n = client.read(&mut buf).await.unwrap();
+            assert_eq!(n, 0, "attempt {attempt} should report end of stream");
+        }
+    })
+    .await
+    .expect("the half-shutdown exchange timed out");
+    assert!(client.is_peer_closed());
+}
+
+/// SC-015 / FR-022: dropping a session without shutting it down neither panics
+/// nor blocks, and actually releases the transport.
+///
+/// The release is observed rather than assumed — the transport counts its own
+/// drops through a handle that outlives it — and the drop is made to happen
+/// with work still outstanding, which is the case where a binding might be
+/// tempted to block.
+#[tokio::test]
+async fn dropping_without_shutdown_neither_blocks_nor_leaks_the_transport() {
+    let (c_ssl, s_ssl) = certs::engine_ssl_pair();
+    let (c_tp, s_tp) = duplex();
+    let watch = c_tp.drop_watch();
+    let controls = c_tp.controls();
+
+    let mut client = SslStream::new(c_ssl, c_tp).unwrap();
+    let mut server = SslStream::new(s_ssl, s_tp).unwrap();
+    let (c, s) = timeout(LIMIT, async {
+        tokio::join!(client.connect(), server.accept())
+    })
+    .await
+    .expect("handshake timed out");
+    c.expect("client handshake");
+    s.expect("server handshake");
+
+    // Leave real work outstanding: plaintext TLS accepted whose ciphertext the
+    // transport never took, and no closure notification at all.
+    controls.close_write_gate();
+    timeout(LIMIT, client.write(b"never delivered"))
+        .await
+        .expect("the write timed out")
+        .unwrap();
+    assert!(!watch.is_dropped());
+
+    timeout(LIMIT, async { drop(client) })
+        .await
+        .expect("dropping the stream blocked");
+    assert_eq!(
+        watch.count(),
+        1,
+        "the transport was not released exactly once"
+    );
+
+    // The peer sees the consequence: a truncation, not a clean close. That is
+    // also proof the drop really did tear the transport down.
+    let mut buf = [0u8; 64];
+    let err = timeout(LIMIT, server.read(&mut buf))
+        .await
+        .expect("the peer's read timed out")
+        .expect_err("a dropped session must not look like an orderly close");
+    assert!(matches!(
+        Error::downcast_io(&err),
+        Some(Error::UnexpectedEof)
+    ));
 }
