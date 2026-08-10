@@ -1,13 +1,16 @@
 //! Directional waker discipline for the tokio stream.
 //!
 //! Everything here is about D-E: the stream keeps a read waiter and a write
-//! waiter, one poll never discards the other direction's registration, and a
-//! read poll that touches the transport's *write* side hands that side's single
-//! waker slot back to whoever was parked on it.
+//! waiter, and one poll never discards the other direction's registration.
 //!
 //! The transport stores exactly one waker per direction, which is what a real
 //! readiness transport does, so these schedules are not artificial: they are the
-//! only orderings in which the single-slot constraint bites.
+//! only orderings in which the single-slot constraint bites. The stream never
+//! puts a caller's waker in that slot. It registers one stable waker of its own
+//! for the transport's write side and keeps the two callers' wakers itself, so
+//! no poll can displace another's registration and a delivered readiness wakes
+//! whichever directions are parked. Cancelling either direction is therefore
+//! harmless, which is what the stranding tests below check from both sides.
 //!
 //! Determinism comes from explicit `poll` calls against separately instrumented
 //! wakers — A for the reader, B for the writer — never from waiting. Every wake
@@ -22,7 +25,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Wake, Waker};
+use std::task::{Context, RawWaker, RawWakerVTable, Wake, Waker};
 use std::time::Duration;
 
 use common::certs;
@@ -175,8 +178,8 @@ fn signal_waker() -> (Arc<SignalWaker>, Waker) {
     (inner, waker)
 }
 
-/// Park a write behind a closed gate, so the stream holds a write waiter and
-/// the transport holds that same waker in its single write slot.
+/// Park a write behind a closed gate, so the stream holds this waker as its
+/// write waiter and the transport holds the stream's stable waker.
 ///
 /// The gate must already be closed and a first write already accepted, so that
 /// admission finds ciphertext queued and refuses to enter OpenSSL at all.
@@ -207,8 +210,8 @@ fn park_read(client: &mut Stream, cx: &mut Context<'_>) {
 ///
 /// D-E wakes both waiters whenever bytes actually move, which is correct and
 /// which would also satisfy a naive "the writer was woken" assertion. Requiring
-/// the measured poll to have moved nothing is what leaves the targeted
-/// ownership handoff as the only possible explanation for the wake.
+/// the measured poll to have moved nothing is what leaves transport readiness
+/// reaching the stable waker as the only possible explanation for the wake.
 fn assert_made_no_progress(stats: &StatsHandle) {
     let events = stats.events();
     assert!(
@@ -245,7 +248,8 @@ async fn schedule_one_inbound_data_wakes_the_reader_and_not_the_writer() {
         park_read(&mut pair.client, &mut cx_a);
         assert_eq!(a.count(), 0, "parking must not wake immediately");
 
-        // The write now parks and takes the transport's write slot from A.
+        // The write now parks too. Both directions are registered with the
+        // stream; the transport's single slot holds the stream's stable waker.
         park_write(&mut pair.client, &mut cx_b, b"the second write");
         assert_eq!(b.count(), 0, "parking must not wake immediately");
         assert_eq!(
@@ -675,4 +679,122 @@ async fn a_cancelled_writer_cannot_strand_a_parked_reader() {
     })
     .await
     .expect("the cancelled-writer regression timed out");
+}
+
+/// Build a `Waker` whose `clone` and `drop` run `hook`.
+///
+/// `std::task::Wake` cannot express this: `Waker::from(Arc<W>)` clones and drops
+/// the `Arc`, never user code. A hand-built vtable can, and the `Waker` contract
+/// permits it — nothing says `clone` and `drop` are trivial, and a real
+/// combinator may well wake something from either. So a registry that runs them
+/// under its own lock is one re-entrant waker away from deadlocking.
+fn reentrant_waker(hook: Arc<dyn Fn() + Send + Sync>) -> Waker {
+    unsafe fn clone(data: *const ()) -> RawWaker {
+        // SAFETY: `data` is the leaked `Arc` this vtable was built with, still
+        // alive because the `Waker` owning it has not been dropped.
+        let hook = unsafe { Arc::from_raw(data as *const HookFn) };
+        (hook.0)();
+        let cloned = hook.clone();
+        std::mem::forget(hook);
+        RawWaker::new(Arc::into_raw(cloned) as *const (), &VTABLE)
+    }
+    unsafe fn wake(data: *const ()) {
+        // SAFETY: as above; this consumes the reference the waker owned.
+        let hook = unsafe { Arc::from_raw(data as *const HookFn) };
+        (hook.0)();
+    }
+    unsafe fn wake_by_ref(data: *const ()) {
+        // SAFETY: as above, without consuming the reference.
+        let hook = unsafe { Arc::from_raw(data as *const HookFn) };
+        (hook.0)();
+        std::mem::forget(hook);
+    }
+    unsafe fn drop_fn(data: *const ()) {
+        // SAFETY: as above; releases the reference this waker held.
+        let hook = unsafe { Arc::from_raw(data as *const HookFn) };
+        (hook.0)();
+    }
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_fn);
+
+    let boxed = Arc::new(HookFn(hook));
+    // SAFETY: the pointer comes from `Arc::into_raw` and the vtable above only
+    // ever reconstitutes it with the matching `Arc::from_raw`.
+    unsafe { Waker::from_raw(RawWaker::new(Arc::into_raw(boxed) as *const (), &VTABLE)) }
+}
+
+struct HookFn(Arc<dyn Fn() + Send + Sync>);
+
+/// Registering a waker must not run caller code under the registry's lock.
+///
+/// The stream keeps one waker per direction behind a mutex, and the same mutex
+/// is taken when the transport delivers write readiness. Cloning the incoming
+/// waker, and dropping the one it displaces, therefore have to happen outside
+/// the guard. A waker whose `clone`/`drop` wakes the stream would otherwise
+/// re-enter that mutex and hang the task instead of failing it.
+///
+/// Driven on its own thread so a deadlock shows up as a failed assertion rather
+/// than a hung suite.
+#[tokio::test]
+async fn registering_a_reentrant_waker_does_not_deadlock() {
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        let body = async {
+            let Pair {
+                mut client,
+                server,
+                client_controls,
+                ..
+            } = connected().await;
+            // Keep the peer alive; dropping it would close the transport and
+            // make the read below fail instead of park.
+            let _server = server;
+
+            client_controls.close_write_gate();
+            client.write_all(b"stranded").await.unwrap();
+
+            // Park a read so the stream holds a registration, then re-poll with
+            // a different waker so registration both clones the newcomer and
+            // drops the one it displaces. Each of those fires the hook, which
+            // wakes the stream's own stable transport waker.
+            let reenter: Arc<dyn Fn() + Send + Sync> = {
+                let controls = client_controls.clone();
+                Arc::new(move || {
+                    // Reaches the stream through the transport's retained
+                    // registration, which is the stable waker under test.
+                    controls.open_write_gate();
+                    controls.close_write_gate();
+                })
+            };
+
+            let mut buf = [0u8; 64];
+            let mut read = Box::pin(client.read(&mut buf));
+            assert!(
+                read.as_mut()
+                    .poll(&mut Context::from_waker(&reentrant_waker(reenter.clone())))
+                    .is_pending(),
+                "no reply can arrive while the gate is shut"
+            );
+            assert!(
+                read.as_mut()
+                    .poll(&mut Context::from_waker(&reentrant_waker(reenter)))
+                    .is_pending(),
+                "still nothing to read"
+            );
+
+            // Reaching here is the assertion: registration completed without
+            // re-entering its own lock.
+            drop(read);
+        };
+
+        ::tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(body);
+        let _ = tx.send(());
+    });
+
+    rx.recv_timeout(std::time::Duration::from_secs(10))
+        .expect("registering a re-entrant waker deadlocked the stream");
 }

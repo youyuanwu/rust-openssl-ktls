@@ -273,16 +273,26 @@ impl Waiters {
 
     /// Store `cx`'s waker for `side`, reusing the existing one when it is
     /// equivalent.
+    ///
+    /// The clone happens before the lock and the displaced waker is dropped
+    /// after it. Both operations run arbitrary caller code — a legitimate
+    /// custom waker may wake something from its own `clone` or `drop` — and if
+    /// that something is this stable waker, doing it under the guard would
+    /// re-enter `wake_by_ref` and deadlock on a non-reentrant mutex.
     fn register(&self, side: Side, cx: &Context<'_>) {
-        let mut slots = self.lock();
-        let slot = match side {
-            Side::Read => &mut slots.read,
-            Side::Write => &mut slots.write,
+        let fresh = cx.waker().clone();
+        let displaced = {
+            let mut slots = self.lock();
+            let slot = match side {
+                Side::Read => &mut slots.read,
+                Side::Write => &mut slots.write,
+            };
+            match slot {
+                Some(existing) if existing.will_wake(cx.waker()) => None,
+                _ => slot.replace(fresh),
+            }
         };
-        match slot {
-            Some(existing) if existing.will_wake(cx.waker()) => {}
-            _ => *slot = Some(cx.waker().clone()),
-        }
+        drop(displaced);
     }
 
     /// Wake both retained directions after observable progress.
