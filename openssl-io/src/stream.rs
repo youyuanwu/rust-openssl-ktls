@@ -25,7 +25,7 @@ type WriteOp<W> = Pin<Box<dyn Future<Output = (W, BufResult<(), Vec<u8>>)>>>;
 /// A TLS stream over any completion-based transport.
 ///
 /// The transport is supplied as something splittable into a reading and a
-/// writing half. [`compio::net::TcpStream`] and `UnixStream` qualify directly;
+/// writing half. compio's `TcpStream` and `UnixStream` qualify directly;
 /// anything else can be passed as the `(read_half, write_half)` tuple produced
 /// by `compio_io::split`, since any `(R, W)` pair is splittable.
 ///
