@@ -359,7 +359,16 @@ where
                 let staged = std::mem::take(&mut self.stage);
                 let p = self.engine.write_plaintext(&staged);
                 self.stage = staged;
-                p?
+                match p {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // OpenSSL refused the bytes outright, so it is not owed
+                        // a retry. Dropping the stage here keeps a later close
+                        // idempotent instead of replaying a doomed write.
+                        self.stage.clear();
+                        return Err(e);
+                    }
+                }
             };
             match progress {
                 Progress::Done(_) => {
@@ -392,7 +401,13 @@ where
                 let staged = std::mem::take(&mut self.stage);
                 let p = self.engine.write_plaintext(&staged);
                 self.stage = staged;
-                p?
+                match p {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.stage.clear();
+                        return Err(e);
+                    }
+                }
             };
             match progress {
                 Progress::Done(n) => {

@@ -590,6 +590,108 @@ async fn dropping_with_an_operation_in_flight_neither_panics_nor_blocks() {
     drop(client);
 }
 
+/// A write rejected after closure must not leave staged plaintext behind, or a
+/// later close would replay a doomed write and fail instead of being idempotent.
+#[compio::test]
+async fn close_stays_idempotent_after_a_rejected_write() {
+    let (mut client, mut server) = connected().await;
+
+    let (c, _) = futures_join(client.close(), async {
+        let buf = Vec::with_capacity(64);
+        let _ = server.read(buf).await;
+    })
+    .await;
+    c.unwrap();
+
+    let BufResult(res, _) = client.write(b"rejected".to_vec()).await;
+    assert!(res.is_err(), "write after close must fail");
+
+    client
+        .close()
+        .await
+        .expect("close must remain idempotent after a rejected write");
+}
+
+/// Transport failure during the client handshake, before any session exists.
+#[compio::test]
+async fn transport_failure_during_handshake_is_classified() {
+    let (c_ssl, _s_ssl) = certs::engine_ssl_pair();
+    let (c_tp, _s_tp) = duplex();
+    c_tp.faults().borrow_mut().read_error = Some(std::io::ErrorKind::ConnectionReset);
+    let (cr, cw) = c_tp.into_halves();
+
+    let mut client = SslStream::new(c_ssl, cr, cw).unwrap();
+    let err = client
+        .connect()
+        .await
+        .expect_err("handshake over a broken transport must fail");
+    assert!(
+        matches!(err, Error::Transport(_)),
+        "expected Transport, got {err:?}"
+    );
+}
+
+/// A peer that disappears mid-handshake must fail the accepting side promptly
+/// with a truncation, not hang.
+#[compio::test]
+async fn peer_disconnect_during_server_handshake_is_unexpected_eof() {
+    let (c_ssl, s_ssl) = certs::engine_ssl_pair();
+    let (c_tp, s_tp) = duplex();
+    let (cr, cw) = c_tp.into_halves();
+    let (sr, sw) = s_tp.into_halves();
+
+    let mut client = SslStream::new(c_ssl, cr, cw).unwrap();
+    let mut server = SslStream::new(s_ssl, sr, sw).unwrap();
+
+    // Let the client emit its ClientHello, then vanish without finishing.
+    let started = compio::time::timeout(Duration::from_millis(20), client.connect()).await;
+    assert!(started.is_err(), "handshake should still be in progress");
+    drop(client);
+    cw_close_after_drop(&mut server).await;
+}
+
+/// Helper: with the client gone, the server's handshake must terminate.
+async fn cw_close_after_drop(server: &mut Stream) {
+    let outcome = compio::time::timeout(Duration::from_secs(2), server.accept()).await;
+    let result = outcome.expect("server handshake must not hang after the peer vanishes");
+    let err = result.expect_err("a vanished peer cannot complete a handshake");
+    assert!(
+        matches!(err, Error::UnexpectedEof | Error::Transport(_)),
+        "expected a truncation or transport failure, got {err:?}"
+    );
+}
+
+/// SC-013's M1 half: abandoned operations run repeatedly through the real
+/// completion-based driver without crash, hang, or corruption.
+#[compio::test]
+async fn repeated_cancellation_keeps_the_session_sound() {
+    let (mut client, mut server, faults) = connected_stallable().await;
+
+    for round in 0..25u32 {
+        abandon_a_write(&mut client, &faults, b"cancelled payload").await;
+
+        // A read is abandoned too, exercising the other direction.
+        let timed_out = compio::time::timeout(Duration::from_millis(5), async {
+            let buf = Vec::with_capacity(64);
+            client.read(buf).await
+        })
+        .await;
+        assert!(timed_out.is_err(), "round {round}: read should have parked");
+
+        // The session must still carry data correctly afterwards.
+        let msg = format!("round-{round}");
+        let (_, got) = futures_join(write_all(&mut server, msg.as_bytes()), async {
+            read_exact(&mut client, msg.len()).await
+        })
+        .await;
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            msg,
+            "round {round}: plaintext corrupted after cancellation"
+        );
+    }
+}
+
 #[compio::test]
 async fn into_inner_recovers_the_transport_when_idle() {
     let (client, _server) = connected().await;

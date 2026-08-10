@@ -136,6 +136,15 @@ impl MemoryWriteHalf {
     }
 }
 
+impl Drop for MemoryWriteHalf {
+    /// Dropping the writing end signals end-of-stream to the peer, as closing a
+    /// socket would. Without this a reader would park forever instead of
+    /// observing the disconnect.
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// Copy out of `chan` into `buf`, honoring the read faults.
 ///
 /// Returns `None` when nothing is available yet and the caller should park.

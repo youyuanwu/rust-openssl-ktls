@@ -93,9 +93,13 @@ dropped, the stored one stays put and the next operation resumes polling it.
 Consequences worth knowing:
 
 - Abandoning a read is safe and the session stays usable. This is the timeout case, and it works.
-- Abandoning a **write** is *indeterminate*: its bytes may or may not have been committed, and the
-  count is lost with the future. The session stays correct and the staged plaintext is completed by
-  the following write, but a caller cannot learn how much got through.
+- Abandoning a **write** is *indeterminate*. The session stays correct, but an unknown prefix of the
+  payload may already have been committed and the count is lost with the future. Precisely: the
+  caller's buffer is forfeited; what survives is ciphertext OpenSSL has already produced (retained in
+  the outbound backlog and delivered by the next operation) and any plaintext OpenSSL is still owed an
+  identical retry for (retained in the staging buffer). Plaintext that had been accepted but whose
+  staging was already cleared, and plaintext never staged at all, is gone. A caller that must know
+  what reached the peer has to resynchronize at the application layer.
 - `into_inner` refuses while an operation is in flight, returning the stream intact. Handing back a
   half the runtime may still be writing into would be unsound.
 - `Drop` simply drops the stored futures, requesting cancellation without awaiting. It never blocks.

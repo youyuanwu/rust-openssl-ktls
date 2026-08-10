@@ -33,15 +33,18 @@
 //!
 //! ```no_run
 //! use compio_io::AsyncWriteExt;
-//! use openssl::ssl::{Ssl, SslConnector, SslMethod};
+//! use openssl::ssl::{SslConnector, SslMethod};
 //! use openssl_io::SslStream;
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let tcp = compio::net::TcpStream::connect("127.0.0.1:4433").await?;
+//! let tcp = compio::net::TcpStream::connect("example.com:4433").await?;
 //! let (read_half, write_half) = tcp.into_split();
 //!
+//! // `configure().into_ssl(domain)` is what sets SNI and hostname
+//! // verification. Building an `Ssl` straight from the context skips both, so
+//! // a certificate trusted for some *other* host would be accepted.
 //! let connector = SslConnector::builder(SslMethod::tls())?.build();
-//! let ssl = Ssl::new(connector.context())?;
+//! let ssl = connector.configure()?.into_ssl("example.com")?;
 //!
 //! let mut stream = SslStream::new(ssl, read_half, write_half)?;
 //! stream.connect().await?;
@@ -85,10 +88,14 @@
 //!   resubmits the remainder. A reported count always means that much ciphertext
 //!   has reached the transport.
 //! - **Abandoning a write is indeterminate.** Dropping a write future — on a
-//!   timeout, say — leaves the session correct and usable, and the staged
-//!   plaintext is completed by the next write. But the byte count is lost with
-//!   the future, so the caller cannot learn how much was committed. Abandoning a
-//!   *read* has no such caveat.
+//!   timeout, say — leaves the session correct and usable, but an unknown
+//!   prefix of the payload may already have been committed, and the count is
+//!   lost with the future. The caller's buffer is forfeited; only ciphertext
+//!   OpenSSL has already produced, or plaintext it is still owed a retry for, is
+//!   retained and completed by the next operation. Anything not yet accepted is
+//!   gone with the future, so a caller that must know what was sent has to
+//!   resynchronize at the application layer. Abandoning a *read* has no such
+//!   caveat.
 //! - **Close explicitly.** Dropping the stream does not send `close_notify`, so
 //!   the peer will see a truncated connection. Call [`SslStream::close`], or
 //!   `shutdown` from compio's `AsyncWrite` trait, which does the same thing.
