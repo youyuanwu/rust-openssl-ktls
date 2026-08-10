@@ -106,6 +106,52 @@ jobs:
         require "default graph" '^tokio v' "$default_tree"
         require "default graph" '^compio(-io|-buf)? v' "$default_tree"
 
+    # SC-021: each stream must be reachable exactly when its own feature is
+    # enabled — the positive direction *and* the negative one. Grepping the
+    # source would only restate the `cfg` attributes, so instead a one-line
+    # probe crate is type-checked against the metadata cargo just produced for
+    # that feature selection, which is the real public surface. A probe that
+    # compiles when it was expected not to is a failure, so a module leaking
+    # out of its `cfg` cannot pass silently. SC-021's doc-example half is
+    # checked separately, by the doctests `cargo test` runs for the library
+    # under each of the feature selections above.
+    - name: Assert each stream is reachable only under its own feature
+      run: |
+        set -euo pipefail
+
+        probe_dir=target/feature-probe
+        mkdir -p "$probe_dir"
+
+        # Type-check `use $2;` against an openssl-io built with exactly the
+        # features in $1, and require the outcome to be $3 (`ok` or `fail`).
+        probe() {
+          local features="$1" path="$2" expect="$3"
+          local meta result
+          meta="$(cargo +${{ matrix.rust }} build --locked -p openssl-io --no-default-features --features "$features" --message-format=json \
+            | grep -o '"[^"]*libopenssl_io-[0-9a-f]*\.rmeta"' | tr -d '"' | tail -n 1)"
+          printf '#[allow(unused_imports)]\nuse %s;\n' "$path" > "$probe_dir/probe.rs"
+          if rustc +${{ matrix.rust }} --edition 2024 --crate-type lib --emit=metadata \
+              --extern openssl_io="$meta" -L dependency=target/debug/deps \
+              -o "$probe_dir/probe.rmeta" "$probe_dir/probe.rs" 2>"$probe_dir/probe.err"; then
+            result=ok
+          else
+            result=fail
+          fi
+          if [ "$result" != "$expect" ]; then
+            echo "::error::$path with --features $features: expected $expect, got $result"
+            cat "$probe_dir/probe.err"
+            exit 1
+          fi
+          echo "$path with --features $features -> $result"
+        }
+
+        probe tokio        openssl_io::tokio::SslStream  ok
+        probe tokio        openssl_io::compio::SslStream fail
+        probe compio       openssl_io::compio::SslStream ok
+        probe compio       openssl_io::tokio::SslStream  fail
+        probe compio,tokio openssl_io::tokio::SslStream  ok
+        probe compio,tokio openssl_io::compio::SslStream ok
+
     # SC-022: the engine is the shared, runtime-neutral state machine. It must
     # name no runtime, no async construct, and no build-time conditional
     # selecting between runtimes. Comment lines are excluded, since the prose

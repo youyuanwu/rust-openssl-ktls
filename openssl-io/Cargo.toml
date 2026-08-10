@@ -82,3 +82,13 @@ required-features = ["tokio"]
 name = "tokio_wakers"
 path = "tests/tokio_wakers.rs"
 required-features = ["tokio"]
+
+[[test]]
+name = "tokio_tcp"
+path = "tests/tokio_tcp.rs"
+required-features = ["tokio"]
+
+[[test]]
+name = "tokio_interop"
+path = "tests/tokio_interop.rs"
+required-features = ["tokio"]
