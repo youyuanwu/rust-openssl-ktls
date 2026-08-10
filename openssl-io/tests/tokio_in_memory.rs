@@ -1031,6 +1031,259 @@ async fn shutdown_after_a_closed_latch_still_delivers_one_close_notify() {
     assert!(server.is_peer_closed());
 }
 
+/// The compio suite's `abandoned_write_then_close_still_sends_close_notify`,
+/// with the tokio-correct outcome: a cancelled write delivered nothing, but the
+/// writes that *were* accepted still go out and closure still notifies the peer
+/// exactly once.
+#[tokio::test]
+async fn shutdown_after_a_cancelled_write_still_delivers_one_close_notify() {
+    let pair = connected().await;
+    let Pair {
+        mut client,
+        mut server,
+        client_controls,
+        ..
+    } = pair;
+
+    // An accepted write whose ciphertext the gate holds back, so the next write
+    // has something to park behind.
+    client_controls.close_write_gate();
+    let accepted = b"accepted before the cancellation".to_vec();
+    assert_eq!(
+        timeout(LIMIT, client.write(&accepted))
+            .await
+            .expect("the first write timed out")
+            .unwrap(),
+        accepted.len()
+    );
+
+    // The second write parks and is abandoned where it stands.
+    let (_idle, waker) = counting_waker();
+    let cancelled = b"never delivered, never staged".to_vec();
+    {
+        let mut write = Box::pin(client.write(&cancelled));
+        assert!(
+            write
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending(),
+            "the gated write must park"
+        );
+    }
+
+    // Closure has to settle the retained ciphertext and then notify.
+    client_controls.open_write_gate();
+    timeout(LIMIT, client.shutdown())
+        .await
+        .expect("the shutdown timed out")
+        .unwrap();
+
+    let mut got = vec![0u8; accepted.len()];
+    timeout(LIMIT, server.read_exact(&mut got))
+        .await
+        .expect("the peer's read timed out")
+        .unwrap();
+    assert_eq!(got, accepted, "the accepted write did not survive closure");
+
+    let mut buf = [0u8; 64];
+    let n = timeout(LIMIT, server.read(&mut buf))
+        .await
+        .expect("the peer's read timed out")
+        .unwrap();
+    assert_eq!(
+        n, 0,
+        "the peer must see a clean end of stream, not the cancelled payload"
+    );
+    assert!(
+        server.is_peer_closed(),
+        "close_notify must still reach the peer after a cancelled write"
+    );
+}
+
+/// The compio suite's `close_stays_idempotent_after_a_rejected_write`: a write
+/// refused after closure must leave nothing behind that a second closure would
+/// try to replay.
+#[tokio::test]
+async fn shutdown_stays_idempotent_after_a_rejected_write() {
+    let pair = connected().await;
+    let Pair {
+        mut client,
+        mut server,
+        client_stats,
+        ..
+    } = pair;
+
+    timeout(LIMIT, client.shutdown())
+        .await
+        .expect("the shutdown timed out")
+        .unwrap();
+
+    let err = timeout(LIMIT, client.write(b"rejected"))
+        .await
+        .expect("the write timed out")
+        .expect_err("a write after closure must fail");
+    assert!(
+        matches!(Error::downcast_io(&err), Some(Error::Closed)),
+        "the rejected write was not classified as a closed session"
+    );
+
+    // Measured after the rejection, so anything the second closure emits is
+    // attributable to it alone.
+    client_stats.reset();
+    timeout(LIMIT, client.shutdown())
+        .await
+        .expect("the repeated shutdown timed out")
+        .expect("closure must stay idempotent after a rejected write");
+    assert_eq!(
+        client_stats.bytes_written(),
+        0,
+        "the repeated closure emitted something after the rejected write"
+    );
+
+    let mut buf = [0u8; 64];
+    let n = timeout(LIMIT, server.read(&mut buf))
+        .await
+        .expect("the peer's read timed out")
+        .unwrap();
+    assert_eq!(n, 0, "the peer must still see one clean end of stream");
+}
+
+/// The compio suite's `repeated_cancellation_keeps_the_session_sound`, covering
+/// *both* directions: every round abandons a parked write and a parked read,
+/// then requires the session to carry plaintext correctly each way.
+///
+/// The repetition is the point: a stale waiter, a half-updated buffer offset or
+/// a retry OpenSSL still believes it is owed only shows up once the same state
+/// has been reused.
+#[tokio::test]
+async fn repeated_read_and_write_cancellation_keeps_the_session_sound() {
+    let pair = connected().await;
+    let Pair {
+        mut client,
+        mut server,
+        client_controls,
+        ..
+    } = pair;
+
+    timeout(LIMIT, async {
+        for round in 0..8u8 {
+            client_controls.close_write_gate();
+
+            // Accepted, but held behind the gate, so the next write parks.
+            let accepted = vec![0xB0 | round; 64];
+            assert_eq!(
+                client.write(&accepted).await.unwrap(),
+                accepted.len(),
+                "round {round}: the gated transport must not fail an accepted write"
+            );
+
+            let (_idle, waker) = counting_waker();
+            {
+                let cancelled = vec![0xFFu8; 64];
+                let mut write = Box::pin(client.write(&cancelled));
+                assert!(
+                    write
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending(),
+                    "round {round}: the gated write must park"
+                );
+            }
+            {
+                let mut buf = [0u8; 64];
+                let mut read = Box::pin(client.read(&mut buf));
+                assert!(
+                    read.as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending(),
+                    "round {round}: nothing has arrived, so the read must park"
+                );
+            }
+
+            // Both directions must still be correct afterwards.
+            client_controls.open_write_gate();
+            client.flush().await.unwrap();
+            let mut got = vec![0u8; accepted.len()];
+            server.read_exact(&mut got).await.unwrap();
+            assert_eq!(
+                got, accepted,
+                "round {round}: plaintext corrupted after cancellation"
+            );
+
+            let reply = vec![0x50 | round; 48];
+            assert_eq!(
+                round_trip(&mut server, &mut client, &reply).await,
+                reply,
+                "round {round}: the reply direction was corrupted"
+            );
+        }
+    })
+    .await
+    .expect("the cancellation rounds timed out");
+}
+
+/// The compio suite's `transport_failure_during_handshake_is_classified`: a
+/// transport that fails before any session exists is a transport failure, not a
+/// TLS one.
+#[tokio::test]
+async fn a_transport_failure_during_the_handshake_is_classified_as_transport() {
+    let (c_ssl, _s_ssl) = certs::engine_ssl_pair();
+    let (c_tp, _s_tp) = duplex();
+    c_tp.controls()
+        .inject_read_error(io::ErrorKind::ConnectionReset);
+
+    let mut client = SslStream::new(c_ssl, c_tp).unwrap();
+    let err = timeout(LIMIT, client.connect())
+        .await
+        .expect("the handshake timed out")
+        .expect_err("a handshake over a broken transport must fail");
+    assert!(
+        matches!(
+            Error::downcast_io(&io::Error::from(err)),
+            Some(Error::Transport(_))
+        ),
+        "a handshake-time transport failure was misclassified"
+    );
+}
+
+/// The compio suite's `peer_disconnect_during_server_handshake_is_unexpected_eof`:
+/// an accepting side whose peer vanishes mid-handshake must fail promptly
+/// rather than wait for a flight that is never coming.
+#[tokio::test]
+async fn a_peer_that_vanishes_mid_handshake_fails_the_accepting_side() {
+    let (c_ssl, s_ssl) = certs::engine_ssl_pair();
+    let (c_tp, s_tp) = duplex();
+    let mut client = SslStream::new(c_ssl, c_tp).unwrap();
+    let mut server = SslStream::new(s_ssl, s_tp).unwrap();
+
+    // The client emits its first flight and then parks waiting for the server.
+    let (_idle, waker) = counting_waker();
+    {
+        let mut connect = Box::pin(client.connect());
+        assert!(
+            connect
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending(),
+            "the client handshake should still be in progress"
+        );
+    }
+    // ...and then vanishes, transport and all.
+    drop(client);
+
+    let err = timeout(LIMIT, server.accept())
+        .await
+        .expect("the server handshake hung after the peer vanished")
+        .expect_err("a vanished peer cannot complete a handshake");
+    assert!(
+        matches!(
+            Error::downcast_io(&io::Error::from(err)),
+            Some(Error::UnexpectedEof | Error::Transport(_))
+        ),
+        "a peer that vanished mid-handshake was misclassified"
+    );
+}
+
 /// SC-016: an idle stream gives its transport back, and the transport works
 /// directly afterwards.
 #[tokio::test]
@@ -1140,6 +1393,86 @@ async fn a_write_reports_acceptance_and_defers_a_transport_failure_to_the_next_c
     })
     .await
     .expect("the retry timed out");
+}
+
+/// SC-016 with D-D step 5: recovery must not become the way a deferred
+/// transport failure disappears.
+///
+/// The failure is latched with a promise — the next write-side call reports it,
+/// exactly once. A *read* can empty both ciphertext buffers while that promise
+/// is still outstanding, which is precisely the state where a refusal based on
+/// buffer occupancy alone would let the transport out and take the error with
+/// it.
+#[tokio::test]
+async fn into_inner_refuses_until_a_deferred_transport_failure_is_reported() {
+    let pair = connected().await;
+    let Pair {
+        mut client,
+        mut server,
+        client_controls,
+        ..
+    } = pair;
+
+    // One-shot: the best-effort delivery attempt fails, so the error is latched
+    // and the ciphertext stays queued.
+    client_controls.inject_write_error(io::ErrorKind::ConnectionReset);
+    let payload = b"accepted by TLS, refused once by the wire".to_vec();
+    let n = timeout(LIMIT, client.write(&payload))
+        .await
+        .expect("the write timed out")
+        .expect("TLS accepted the plaintext, so the write must report it");
+    assert_eq!(n, payload.len());
+    assert_eq!(
+        client_controls.queued_for_peer(),
+        0,
+        "the injected failure did not stop the ciphertext"
+    );
+
+    // A read now drains that ciphertext — the injected fault was one-shot — so
+    // nothing is buffered in either direction any more. The latched error is
+    // all that is left.
+    let (_idle, waker) = counting_waker();
+    let mut storage = [0u8; 256];
+    let mut buf = ReadBuf::new(&mut storage);
+    assert!(
+        Pin::new(&mut client)
+            .poll_read(&mut Context::from_waker(&waker), &mut buf)
+            .is_pending(),
+        "the peer has sent nothing, so the read must park"
+    );
+    let mut got = vec![0u8; payload.len()];
+    timeout(LIMIT, server.read_exact(&mut got))
+        .await
+        .expect("the peer's read timed out")
+        .unwrap();
+    assert_eq!(got, payload, "the read did not push the backlog out");
+
+    // Empty buffers, and recovery must still be refused: the promise is unkept.
+    let Err((client, err)) = client.into_inner() else {
+        panic!("recovery must be refused while a transport failure is unreported");
+    };
+    assert!(matches!(
+        Error::downcast_io(&io::Error::from(err)),
+        Some(Error::Transport(_))
+    ));
+
+    // The refusal returned the stream intact, so the promise can still be kept:
+    // a write-side call reports the deferred failure, once.
+    let mut client = client;
+    let err = timeout(LIMIT, client.flush())
+        .await
+        .expect("the flush timed out")
+        .expect_err("the deferred transport failure was dropped");
+    assert!(matches!(
+        Error::downcast_io(&err),
+        Some(Error::Transport(_))
+    ));
+
+    // And only then does the transport come back.
+    assert!(
+        client.into_inner().is_ok(),
+        "recovery stayed refused after the deferred failure was reported"
+    );
 }
 
 // --- deterministic fault injection ------------------------------------------
@@ -1765,9 +2098,21 @@ async fn dropping_without_shutdown_neither_blocks_nor_leaks_the_transport() {
         .unwrap();
     assert!(!watch.is_dropped());
 
-    timeout(LIMIT, async { drop(client) })
+    // `Drop` is synchronous, so an async timeout wrapped around it would never
+    // get to run if it blocked — the timer and the drop would be on the same
+    // thread and the test would hang instead of failing. The drop therefore
+    // happens on its own OS thread and the timeout is applied to the completion
+    // signal, which a blocking `Drop` genuinely cannot send.
+    let (done, finished) = tokio::sync::oneshot::channel::<()>();
+    let dropper = std::thread::spawn(move || {
+        drop(client);
+        let _ = done.send(());
+    });
+    timeout(LIMIT, finished)
         .await
-        .expect("dropping the stream blocked");
+        .expect("dropping the stream blocked")
+        .expect("the dropping thread panicked");
+    dropper.join().expect("the dropping thread panicked");
     assert_eq!(
         watch.count(),
         1,

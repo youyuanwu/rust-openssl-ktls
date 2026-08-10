@@ -100,20 +100,46 @@ write path — which renegotiation or a TLS 1.3 `KeyUpdate` would produce — te
 direction. That is the concrete caller-visible cost of deferring those features; reads, flush and
 shutdown continue to work so the peer is not left truncated.
 
-### Waker ownership is handed back explicitly
+### The transport's write side always sees one stable, stream-owned waker
 
 A transport typically retains **one** waker per direction. `tokio::io::split` serialises polls
-behind a lock and releases it on return, so a reader and a writer genuinely interleave.
+behind a lock and releases it on return, so a reader and a writer genuinely interleave — and *both*
+of this stream's directions can need transport write readiness. A write drains its own ciphertext;
+a read drains the backlog an earlier write left behind, because otherwise "write a request, then
+read the reply" would deadlock.
 
-That creates a hazard. When the read path drains the write-side backlog and the transport returns
-`Pending`, the reader's waker overwrites the writer's in the transport's single write slot. If the
-read future is then dropped — by a timeout, say — the transport later wakes a dead task and a
-writer parked in `poll_write` sleeps forever.
+If each poll registered its own caller's waker on the transport's write side, whichever polled last
+would displace the other. Cancelling that last poller then leaves the transport holding a dead
+waker while the survivor sleeps on. Both orderings are reachable, and both strand the caller's
+ciphertext:
 
-So whenever the read path polls the transport's write side and gets `Pending`, it wakes the stored
-write waiter before returning, handing registration ownership back. The writer re-polls,
-re-registers, and progress resumes. `tests/tokio_wakers.rs` proves this with two explicit waker
-schedules and a dropped-reader regression test; removing the hand-back makes two of them fail.
+- reader parks, writer polls and is cancelled → reopening the transport wakes the dead writer, and
+  the reader never learns it can push the request out;
+- writer parks, reader polls and is cancelled → reopening wakes the dead reader, and the writer
+  sleeps with its record queued.
+
+Waking the other direction on `Pending` fixes neither properly: reader-wakes-writer plus
+writer-wakes-reader is a no-progress wake loop, which the anti-livelock rule below forbids outright.
+
+So the registration is never contended in the first place. The stream owns an `Arc<Waiters>`,
+implements `std::task::Wake` for it, and passes *that* waker to **every** transport write-direction
+poll — `poll_write` during a drain, and the transport's own `poll_flush` and `poll_shutdown`. It
+never changes, so no poll can displace another's registration. `Waiters` also holds the two caller
+wakers, one per direction, so delivering a wakeup means waking whichever directions are parked:
+both, when both are. That makes the ownership question disappear rather than arbitrating it.
+
+Two consequences are worth stating:
+
+- A direction's caller waker is stored **before** the transport is polled, not after `Pending` is
+  observed. The transport holds a shared waker, so a readiness wake arriving between the poll and
+  the return would otherwise find an empty slot and be lost.
+- Waking the read side on *write* readiness is deliberate. A read parked with backlog queued
+  genuinely needs it. The cost is a bounded number of spurious polls, and only the transport can
+  trigger one.
+
+`tests/tokio_wakers.rs` proves all of this with explicit waker schedules, a cancelled-reader
+regression test and a cancelled-writer one. Reverting `src/tokio.rs` to the previous hand-back
+scheme fails all three.
 
 The complementary rule prevents a wake storm: the "wake both directions" rule fires only on
 *observable* progress — bytes moved, EOF observed, or a lifecycle transition — never
@@ -167,7 +193,7 @@ Caller buffers are never handed to the transport, and are never held across a po
 | Error classification | `src/error.rs` unit tests |
 | tokio transport and its fault hooks | `tests/tokio_transport.rs` |
 | End-to-end TLS, deterministic | `tests/tokio_in_memory.rs` |
-| Waker schedules and cancellation hand-back | `tests/tokio_wakers.rs` |
+| Waker schedules and cancellation regressions | `tests/tokio_wakers.rs` |
 | End-to-end TLS over a real socket | `tests/tokio_tcp.rs` |
 | Interoperability with `tokio-openssl` | `tests/tokio_interop.rs` |
 
@@ -180,53 +206,61 @@ of these. Timeouts are failure detectors only — no test sleeps for synchronisa
 ## Parity with the compio suite
 
 Behavioural coverage is mirrored. Rows marked *divergent* assert a deliberately different result.
+Every citation below names a test whose body executes the behaviour in the row; where no tokio test
+does, the row is an explicit exception with the reason, rather than a nearby test pressed into
+service.
 
 | Behaviour | compio | tokio | |
 |---|---|---|---|
 | Handshake over a handle-free transport | `handshake_completes_over_a_transport_with_no_handle` | `explicit_handshake_completes_in_both_roles` | divergent — tokio refuses an implicit handshake |
 | Round trip, both directions | `round_trips_in_both_directions` | `small_and_multi_record_payloads_round_trip_in_both_directions` | equivalent |
-| Payload spanning many records | `round_trips_a_payload_spanning_many_records` | `small_and_multi_record_payloads_round_trip_in_both_directions` | equivalent |
+| Payload spanning many records | `round_trips_a_payload_spanning_many_records` | `small_and_multi_record_payloads_round_trip_in_both_directions` | equivalent — its 200,000-byte leg |
 | Small read buffer leaves a remainder | `small_read_buffer_leaves_the_remainder` | `a_small_buffer_leaves_the_remainder_for_the_next_read` | equivalent |
 | Oversized write reports a partial count | `oversized_write_reports_a_partial_count` | `an_oversized_write_reports_one_record_and_an_empty_write_is_a_no_op` | equivalent |
 | Short transport writes | `survives_short_transport_writes` | `transport_writes_truncated_to_a_few_bytes_still_deliver_every_record` | equivalent |
 | Fragmented delivery | `survives_fragmented_delivery` | `reads_fragmented_below_a_record_deliver_intact_plaintext` | equivalent |
-| Empty buffers are no-ops | `empty_buffers_are_no_ops` | `an_empty_buffer_after_the_handshake_is_a_no_op` | equivalent |
+| Empty buffers are no-ops | `empty_buffers_are_no_ops` | `an_empty_buffer_after_the_handshake_is_a_no_op` (read), `an_oversized_write_reports_one_record_and_an_empty_write_is_a_no_op` (write) | equivalent — split across two tests |
 | Clean close reads as EOF, repeatedly | `clean_close_reads_as_end_of_stream_repeatedly` | `peer_closure_reads_as_sticky_end_of_stream` | equivalent |
 | Double close succeeds | `double_close_succeeds` | `repeated_shutdown_succeeds_without_a_second_close_notify` | equivalent |
 | Write after close is closed | `write_after_close_is_reported_as_closed` | `a_write_after_closure_is_classified_as_a_closed_session` | equivalent |
 | Trait shutdown performs a TLS close | `trait_shutdown_performs_a_tls_close` | `shutdown_sends_close_notify_and_the_peer_sees_sticky_end_of_stream` | equivalent |
 | Truncation distinct from clean EOF | `truncation_is_distinct_from_clean_end_of_stream` | `truncation_is_distinct_from_a_clean_end_of_stream` | equivalent |
 | Untrusted certificate fails | `untrusted_certificate_fails_verification` | `an_untrusted_certificate_fails_the_handshake_by_value` | equivalent |
-| Transport failure classified | `transport_failure_is_classified_as_transport` | `every_operational_classification_is_recovered_by_value` | equivalent |
-| Handshake transport failure | `transport_failure_during_handshake_is_classified` | `provoke_transport_failure` | equivalent |
-| Peer disconnect during server handshake | `peer_disconnect_during_server_handshake_is_unexpected_eof` | `provoke_unexpected_eof` | equivalent |
+| Post-handshake transport failure classified | `transport_failure_is_classified_as_transport` | `every_operational_classification_is_recovered_by_value`, via `provoke_transport_failure` | equivalent — both inject a read failure on an established session |
+| Handshake transport failure | `transport_failure_during_handshake_is_classified` | `a_transport_failure_during_the_handshake_is_classified_as_transport` | equivalent |
+| Peer disconnect during server handshake | `peer_disconnect_during_server_handshake_is_unexpected_eof` | `a_peer_that_vanishes_mid_handshake_fails_the_accepting_side` | equivalent |
 | `into_inner` recovers an idle transport | `into_inner_recovers_the_transport_when_idle` | `into_inner_returns_an_idle_transport` | equivalent |
-| `into_inner` refuses with work outstanding | `into_inner_refuses_while_an_operation_is_in_flight` | `into_inner_refuses_with_queued_ciphertext_and_returns_the_intact_stream` | divergent — tokio holds no in-flight op, so the refusal is about queued ciphertext |
+| `into_inner` refuses with work outstanding | `into_inner_refuses_while_an_operation_is_in_flight` | `into_inner_refuses_with_queued_ciphertext_and_returns_the_intact_stream`, `into_inner_refuses_until_a_deferred_transport_failure_is_reported` | divergent — tokio holds no in-flight op, so the refusal is about queued ciphertext and unreported deferred failures |
 | Abandoned read leaves the session usable | `abandoned_read_leaves_the_session_usable` | `a_cancelled_pending_read_loses_no_plaintext` | divergent — tokio loses no plaintext at all; compio forfeits the buffer |
 | Abandoned write, session stays correct | `abandoned_write_then_read_keeps_the_session_correct` | `a_cancelled_pending_write_delivers_none_of_its_own_plaintext` | divergent — tokio delivers *nothing*; compio may have committed a prefix |
-| Abandoned write then flush settles it | `abandoned_write_then_flush_settles_it` | `a_gated_transport_accepts_the_write_but_delivers_only_after_flush` | divergent — see the delivery-boundary section |
-| Abandoned write then close sends close_notify | `abandoned_write_then_close_still_sends_close_notify` | `shutdown_after_a_closed_latch_still_delivers_one_close_notify` | equivalent |
-| Close idempotent after a rejected write | `close_stays_idempotent_after_a_rejected_write` | `shutdown_after_a_closed_latch_still_delivers_one_close_notify` | equivalent |
-| Repeated cancellation stays sound | `repeated_cancellation_keeps_the_session_sound` | `a_cancelled_pending_read_loses_no_plaintext` | equivalent |
+| Abandoned write then flush settles it | `abandoned_write_then_flush_settles_it` | `a_cancelled_pending_write_delivers_none_of_its_own_plaintext` | divergent — the flush settles exactly what TLS accepted, and the cancelled call contributed nothing to it |
+| Abandoned write then close sends close_notify | `abandoned_write_then_close_still_sends_close_notify` | `shutdown_after_a_cancelled_write_still_delivers_one_close_notify` | divergent — the retained ciphertext is the *accepted* writes' only; the cancelled call's payload never reaches the peer |
+| Close idempotent after a rejected write | `close_stays_idempotent_after_a_rejected_write` | `shutdown_stays_idempotent_after_a_rejected_write` | equivalent |
+| Repeated cancellation stays sound | `repeated_cancellation_keeps_the_session_sound` | `repeated_read_and_write_cancellation_keeps_the_session_sound` | equivalent — both abandon a write and a read every round |
 | Drop without close neither panics nor blocks | `dropping_without_close_neither_panics_nor_blocks` | `dropping_without_shutdown_neither_blocks_nor_leaks_the_transport` | equivalent |
 | Drop with an operation in flight | `dropping_with_an_operation_in_flight_neither_panics_nor_blocks` | — | **exception**: tokio stores no in-flight operation, so the state cannot exist |
 | TLS over a real socket | `handshake_and_round_trip_over_tcp` | `handshake_and_round_trip_over_tcp` | equivalent |
 
+A note on the drop test, because an async timeout cannot detect a blocking synchronous `Drop`:
+tokio cannot preempt code that never yields, so a `Drop` that blocked would hang the timer along
+with everything else. The tokio test therefore drops the stream on a separate OS thread and applies
+the timeout to that thread's completion signal, which a blocking `Drop` genuinely cannot send.
+
 Rows with no compio counterpart, because they test behaviour the completion model does not have:
-the waker schedules and dropped-reader hand-back (`tests/tokio_wakers.rs`), the pre-handshake
-refusal, the deferred-delivery round trip, the read-path skip guard, the one-record backlog bound,
-and half-shutdown over both transports.
+the waker schedules and the two cancellation regressions (`tests/tokio_wakers.rs`), the
+pre-handshake refusal, the deferred-delivery round trip, the read-path skip guard, the one-record
+backlog bound, and half-shutdown over both transports.
 
 ## Acceptance coverage
 
 | Story | Covered by |
 |---|---|
 | P1 client from tokio | `explicit_handshake_completes_in_both_roles`, `round_trip`, `an_untrusted_certificate_fails_the_handshake_by_value`, `read_before_the_handshake_is_refused_without_touching_the_transport` |
-| P2 server-side termination | `explicit_handshake_completes_in_both_roles`, `small_and_multi_record_payloads_round_trip_in_both_directions`, `provoke_unexpected_eof` |
+| P2 server-side termination | `explicit_handshake_completes_in_both_roles`, `small_and_multi_record_payloads_round_trip_in_both_directions`, `a_peer_that_vanishes_mid_handshake_fails_the_accepting_side` |
 | P3 transport without a handle | `tests/tokio_in_memory.rs` throughout, plus `tests/tokio_tcp.rs` for the same type over a socket |
 | P4 concurrent read and write | `split_halves_exchange_multiple_records_from_separate_tasks`, both waker schedules, `a_half_shutdown_stream_keeps_reading_until_the_peer_closes` |
 | P5 clean close | `shutdown_sends_close_notify_and_the_peer_sees_sticky_end_of_stream`, `repeated_shutdown_succeeds_without_a_second_close_notify`, `truncation_is_distinct_from_a_clean_end_of_stream` |
-| P6 abandoning an operation | `a_cancelled_pending_write_delivers_none_of_its_own_plaintext`, `a_cancelled_pending_read_loses_no_plaintext` |
+| P6 abandoning an operation | `a_cancelled_pending_write_delivers_none_of_its_own_plaintext`, `a_cancelled_pending_read_loses_no_plaintext`, `repeated_read_and_write_cancellation_keeps_the_session_sound`, `dropping_a_reader_cannot_strand_a_parked_writer`, `a_cancelled_writer_cannot_strand_a_parked_reader` |
 | P7 interoperability | `this_crate_as_client_against_a_tokio_openssl_server`, `this_crate_as_server_against_a_tokio_openssl_client` |
 | P8 selecting one runtime | CI dependency-graph and feature-reachability assertions |
 

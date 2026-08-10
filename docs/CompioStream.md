@@ -1,8 +1,15 @@
 # Compio OpenSSL Stream
 
-`openssl-io` is an experimental crate providing an async TLS stream over OpenSSL for the
-[compio](https://docs.rs/compio) runtime. It is not published, its API is unstable, and it targets
+`openssl_io::compio::SslStream<R, W>` is the completion-based binding of the `openssl-io` crate: an
+async TLS stream over OpenSSL for the [compio](https://docs.rs/compio) runtime. It lives behind the
+crate's `compio` feature and is one of two bindings driven by the same synchronous TLS engine; the
+readiness-based one is `openssl_io::tokio::SslStream<S>`, described in
+[TokioStream.md](TokioStream.md). The crate is not published, its API is unstable, and it targets
 Linux only. Kernel TLS offload is deliberately out of scope — that is what `openssl-ktls` is for.
+
+This document covers what is specific to the compio binding. The engine-reuse experiment the tokio
+binding tested, and every place the two bindings deliberately behave differently, are recorded in
+[TokioStream.md](TokioStream.md).
 
 ## Why a separate crate
 
@@ -11,23 +18,32 @@ whether a connection is ready before transferring. That matches `epoll`, but not
 interfaces such as `io_uring`, where the caller submits a buffer the kernel takes ownership of and
 returns only once the transfer has finished.
 
-`openssl-ktls`'s Tokio stream is built the readiness way: it owns an `AsyncFd` and attaches a socket
-BIO to the raw file descriptor. That approach cannot be retrofitted to compio, because the entire
-buffer-ownership contract differs. Hence a separate crate rather than a feature flag.
+`openssl-ktls`'s Tokio stream is built the readiness way *around a socket*: it owns an `AsyncFd` and
+attaches a socket BIO to the raw file descriptor. That approach cannot be retrofitted to compio,
+because the entire buffer-ownership contract differs — and it cannot serve a transport with no
+operating-system handle at all. Hence a separate crate.
+
+What a separate crate did *not* have to mean is a separate state machine. Everything below the pump
+— the OpenSSL session, the BIO pair, record handling, error classification — is shared, and
+`openssl-io` now carries both bindings behind Cargo features, `compio` and `tokio`, both enabled by
+default. Selecting one keeps the other runtime's packages out of the dependency graph entirely.
 
 ## Architecture
 
 Three layers, deliberately separated:
 
 ```
-   caller ──► SslStream<R, W>          public API, compio_io::AsyncRead/AsyncWrite
-                   │
+   caller ──► compio::SslStream<R, W>  public API, compio_io::AsyncRead/AsyncWrite
+                   │                   (src/compio.rs, feature = "compio")
                    ├── pump            async; moves ciphertext, owns in-flight transport ops
                    │
                    └── TlsEngine       synchronous; SSL + one half of a BIO pair, no I/O at all
-                            │
+                            │          (src/engine.rs, shared with the tokio binding)
                        BIO pair ──────► transport (R, W)
 ```
+
+The bottom two boxes are exactly the ones `openssl_io::tokio::SslStream` reuses unchanged; only the
+pump differs between the bindings.
 
 The engine performs no I/O whatsoever. It consumes ciphertext, produces ciphertext, and reports what
 it needs next. Everything about the OpenSSL state machine — handshakes, record boundaries, closure,
@@ -163,10 +179,11 @@ Delivered (M1):
 
 Not yet built (M2):
 
-- **Concurrent split halves.** Today the stream is `&mut self`, so one operation at a time. True
-  full-duplex needs read and write halves sharing a core, which is where the multi-waiter waker
+- **Concurrent split halves.** Today the compio stream is `&mut self`, so one operation at a time.
+  True full-duplex needs read and write halves sharing a core, which is where the multi-waiter waker
   machinery becomes necessary. Note an `Arc<WakeState>` is required rather than `Rc`, because `Waker`
-  is `Send + Sync`.
+  is `Send + Sync`. The tokio binding gets independent halves from `tokio::io::split`, and its
+  `Arc<Waiters>` is what that prediction looks like in practice.
 - **Interoperability testing against an independent implementation.** rustls is the right peer;
   `tokio-openssl` and `openssl s_client` do not count, being wrappers around the same OpenSSL.
 - **Renegotiation and post-handshake key update.** Neither `SSL_renegotiate` nor `SSL_key_update` is
@@ -188,12 +205,16 @@ restore the old floor without affecting this crate.
 
 | Area | Where |
 |---|---|
-| OpenSSL state machine, in memory | `src/engine.rs` unit tests |
-| BIO pair bindings and bounds | `src/ffi.rs` unit tests |
-| Error classification | `src/error.rs` unit tests |
+| OpenSSL state machine, in memory | `src/engine.rs` unit tests (shared) |
+| BIO pair bindings and bounds | `src/ffi.rs` unit tests (shared) |
+| Error classification | `src/error.rs` unit tests (shared) |
 | In-memory transport and its fault hooks | `tests/transport.rs` |
 | End-to-end TLS, deterministic | `tests/in_memory.rs` |
 | End-to-end TLS over a real socket | `tests/tcp.rs` |
+
+The tokio binding's targets are all prefixed `tokio_`; [TokioStream.md](TokioStream.md) maps them,
+and its parity table records test-by-test which compio behaviour each one mirrors, which ones
+deliberately assert a different result, and which have no counterpart.
 
 The in-memory transport exists because flush ordering, partial writes, stalled writes, fragmented
 records, and truncation are timing-dependent over loopback TCP but deterministic in memory. TCP is a

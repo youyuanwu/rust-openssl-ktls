@@ -31,11 +31,15 @@
 //!   violation is a permanent, session-killing "bad write retry" rather than a
 //!   stall. So plaintext is offered only when nothing is queued in the engine
 //!   or in this stream, and a pending write has consumed nothing.
-//! - **Read and write waiters are stored separately.** A transport retains one
-//!   waker per direction, so when a read poll uses the transport's *write* side
-//!   and finds it not ready, it hands that single slot back by waking the
-//!   stored writer. Without that, a reader that is dropped on a timeout would
-//!   strand a writer on a dead waker.
+//! - **The transport always sees one stable waker on its write side.** A
+//!   transport retains one waker per direction, and both directions of this
+//!   stream can need write readiness — a write drains its own ciphertext, and
+//!   a read drains the backlog left behind by an earlier write. If each poll
+//!   registered its own caller's waker there, whichever polled last would
+//!   displace the other, and cancelling it would leave the transport holding a
+//!   dead waker. So every transport write-direction poll passes a waker owned
+//!   by the *stream*, and waking it wakes whichever of the two directions is
+//!   parked. Nothing can be stolen because nothing is ever registered twice.
 //! - **A read still drains queued ciphertext.** A write's delivery is
 //!   best-effort until flush, so the read path must push any residual backlog
 //!   out; otherwise "write a request, then read the reply" could deadlock with
@@ -112,7 +116,8 @@
 
 use std::io;
 use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Context, Poll, Wake, Waker};
 
 use openssl::ssl::{Ssl, SslRef};
 
@@ -191,8 +196,9 @@ impl WriteFailure {
 enum Drain {
     /// Nothing is queued: everything produced so far has reached the transport.
     Complete,
-    /// The transport is not ready. The stored writer has been woken so it can
-    /// reclaim the transport's single write-waker slot.
+    /// The transport is not ready. This poll's waker is registered for the read
+    /// direction, and the transport holds the stream's stable write waker, so
+    /// write readiness reaches this task and the write direction alike.
     Pending,
     /// The transport failed. The error was latched for the write direction.
     Failed,
@@ -210,12 +216,133 @@ enum Inbound {
     Eof,
 }
 
+/// Which of the stream's two directions a poll belongs to.
+///
+/// Both of them can end up waiting on the transport's *write* side — a write
+/// drains its own ciphertext, and a read drains the backlog an earlier write
+/// left behind — so a wakeup has to be able to reach either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Read,
+    Write,
+}
+
+/// The waker of the task parked on each direction, at most one apiece.
+#[derive(Debug, Default)]
+struct Slots {
+    read: Option<Waker>,
+    write: Option<Waker>,
+}
+
+/// The one place a parked task's waker lives, and the stable waker the
+/// transport's write direction is given.
+///
+/// A transport retains a single waker per direction. Handing it a caller's
+/// waker directly would make the two directions compete for that one slot:
+/// whichever polled last would displace the other's registration, and if that
+/// last poller were then cancelled the transport would wake a dead task while
+/// the survivor slept on — the caller's ciphertext stranded and neither
+/// direction able to move it.
+///
+/// So this value *is* the waker the transport sees on its write side, for every
+/// write-direction poll the stream makes. It never changes, so no poll can
+/// displace another's registration, and delivering a wakeup means waking
+/// whichever of the two directions is currently parked — both, when both are.
+///
+/// Waking the read side on write readiness is deliberate rather than
+/// incidental: a read that has parked with backlog queued genuinely needs that
+/// readiness to push the backlog out. A spurious poll is the cost, and it is
+/// bounded by the fact that only the transport ever wakes this — a poll of this
+/// stream that achieves nothing still wakes nothing.
+///
+/// Locking rule: the mutex guard is never held across a `Waker::wake` call or a
+/// transport poll, so a transport that wakes inline cannot deadlock against it.
+/// Poisoning is recovered rather than unwrapped, so a panicking task reports its
+/// own failure instead of a cascade of secondary ones.
+#[derive(Debug, Default)]
+struct Waiters {
+    slots: Mutex<Slots>,
+}
+
+impl Waiters {
+    fn lock(&self) -> MutexGuard<'_, Slots> {
+        self.slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Store `cx`'s waker for `side`, reusing the existing one when it is
+    /// equivalent.
+    fn register(&self, side: Side, cx: &Context<'_>) {
+        let mut slots = self.lock();
+        let slot = match side {
+            Side::Read => &mut slots.read,
+            Side::Write => &mut slots.write,
+        };
+        match slot {
+            Some(existing) if existing.will_wake(cx.waker()) => {}
+            _ => *slot = Some(cx.waker().clone()),
+        }
+    }
+
+    /// Wake both retained directions after observable progress.
+    ///
+    /// "Observable progress" means bytes actually moved, end of file was seen,
+    /// or the session changed lifecycle state — never merely that a poll
+    /// happened. The current task's own registration is left exactly where it
+    /// is: waking it would only schedule a redundant poll, and removing it
+    /// would drop a registration this poll may still be relying on.
+    fn wake_progress(&self, cx: &Context<'_>) {
+        let (read, write) = {
+            let mut slots = self.lock();
+            (
+                take_other(&mut slots.read, cx),
+                take_other(&mut slots.write, cx),
+            )
+        };
+        if let Some(waker) = read {
+            waker.wake();
+        }
+        if let Some(waker) = write {
+            waker.wake();
+        }
+    }
+}
+
+impl Wake for Waiters {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let (read, write) = {
+            let mut slots = self.lock();
+            (slots.read.take(), slots.write.take())
+        };
+        if let Some(waker) = read {
+            waker.wake();
+        }
+        if let Some(waker) = write {
+            waker.wake();
+        }
+    }
+}
+
+/// Take a retained waker unless it belongs to the task doing the waking.
+fn take_other(slot: &mut Option<Waker>, cx: &Context<'_>) -> Option<Waker> {
+    match slot {
+        Some(existing) if existing.will_wake(cx.waker()) => None,
+        _ => slot.take(),
+    }
+}
+
 /// A TLS stream over any readiness-based transport.
 ///
 /// The transport is one value implementing tokio's [`AsyncRead`] and
 /// [`AsyncWrite`]; it does not have to be backed by an operating-system handle.
 /// Use `tokio::io::split` for concurrent read and write halves — the stream
-/// keeps separate read and write waiters precisely so that works.
+/// keeps a waker slot per direction, and hands the transport one stable waker
+/// of its own, precisely so that works.
 ///
 /// # Cancellation
 ///
@@ -245,10 +372,15 @@ pub struct SslStream<S> {
     /// caller buffer is ever handed to the transport.
     read_scratch: Vec<u8>,
 
-    /// Most recent task parked on the read direction.
-    read_waiter: Option<Waker>,
-    /// Most recent task parked on the handshake or write direction.
-    write_waiter: Option<Waker>,
+    /// Most recent task parked on each direction.
+    ///
+    /// Shared with the transport: it is also the waker every write-direction
+    /// transport poll registers, so write readiness reaches whichever
+    /// direction is waiting on it.
+    waiters: Arc<Waiters>,
+    /// The `Waker` view of [`Self::waiters`], built once and handed to the
+    /// transport's write side on every poll.
+    write_ready: Waker,
 
     /// A transport *write* failure observed on a path whose own result must not
     /// carry it.
@@ -279,6 +411,8 @@ impl<S> SslStream<S> {
     /// No handshake is performed: call [`SslStream::connect`] or
     /// [`SslStream::accept`] next, because the role cannot be inferred later.
     pub fn new(ssl: Ssl, transport: S) -> Result<Self, Error> {
+        let waiters = Arc::new(Waiters::default());
+        let write_ready = Waker::from(waiters.clone());
         Ok(Self {
             engine: TlsEngine::new(ssl)?,
             transport,
@@ -287,8 +421,8 @@ impl<S> SslStream<S> {
             outbound: Vec::new(),
             outbound_offset: 0,
             read_scratch: vec![0u8; CIPHER_CHUNK],
-            read_waiter: None,
-            write_waiter: None,
+            waiters,
+            write_ready,
             pending_write_error: None,
             shutdown_state: ShutdownState::Open,
             write_failure: None,
@@ -325,10 +459,11 @@ impl<S> SslStream<S> {
     /// Recover the transport, consuming the stream.
     ///
     /// Refused whenever handing the transport back would silently discard
-    /// state: ciphertext queued in either direction, a session that has been
-    /// terminally failed on the write side, or a closure sequence stopped
-    /// halfway through. A refusal returns the stream itself alongside the
-    /// reason, so nothing is destroyed by asking.
+    /// state: ciphertext queued in either direction, a transport failure the
+    /// write direction has been promised, a session that has been terminally
+    /// failed on the write side, or a closure sequence stopped halfway
+    /// through. A refusal returns the stream itself alongside the reason, so
+    /// nothing is destroyed by asking.
     ///
     /// A peer-closed session is *not* a refusal. Nothing failed there and
     /// nothing is buffered; the write direction is simply finished.
@@ -339,6 +474,12 @@ impl<S> SslStream<S> {
             Some("ciphertext received from the transport has not been consumed")
         } else if self.outbound_len() > 0 || self.engine.outbound_pending() > 0 {
             Some("ciphertext produced by TLS has not reached the transport")
+        } else if self.pending_write_error.is_some() {
+            // Latched with the promise that the next write-side call reports
+            // it. A read can empty both buffers while it is still latched, so
+            // without this the transport would come back and the failure would
+            // vanish with the stream.
+            Some("a deferred transport failure has not been reported")
         } else if self.write_failure == Some(WriteFailure::Tls) {
             Some("the write direction failed terminally")
         } else if self.shutdown_state != ShutdownState::Open
@@ -386,41 +527,22 @@ impl<S> SslStream<S> {
 
     /// Register `cx`'s waker for the read direction, leaving the write
     /// direction's alone.
-    fn register_read_waiter(&mut self, cx: &Context<'_>) {
-        register(&mut self.read_waiter, cx);
+    fn register_read_waiter(&self, cx: &Context<'_>) {
+        self.waiters.register(Side::Read, cx);
     }
 
     /// Register `cx`'s waker for the write direction, leaving the read
     /// direction's alone.
-    fn register_write_waiter(&mut self, cx: &Context<'_>) {
-        register(&mut self.write_waiter, cx);
-    }
-
-    /// Hand the transport's single write-waker slot back to the writer.
-    ///
-    /// A read poll that touches the transport's write side overwrites whatever
-    /// waker a parked writer had registered there. Waking that writer makes it
-    /// re-poll and re-register, so a reader that is subsequently dropped cannot
-    /// leave the writer waiting on a waker nobody will ever fire.
-    ///
-    /// This is deliberately *not* a progress wake: it targets only the writer,
-    /// never the reader, so it cannot form a no-progress wake loop.
-    fn wake_writer(&mut self) {
-        if let Some(waker) = self.write_waiter.take() {
-            waker.wake();
-        }
+    fn register_write_waiter(&self, cx: &Context<'_>) {
+        self.waiters.register(Side::Write, cx);
     }
 
     /// Wake both retained directions after observable progress.
     ///
-    /// "Observable progress" means bytes actually moved, end of file was seen,
-    /// or the session changed lifecycle state — never merely that a poll
-    /// happened. The current task's own waker is skipped: this poll will either
-    /// return `Ready` or register again before returning `Pending`, so waking
-    /// it would only schedule a redundant poll.
-    fn wake_progress(&mut self, cx: &Context<'_>) {
-        wake_other(&mut self.read_waiter, cx);
-        wake_other(&mut self.write_waiter, cx);
+    /// See [`Waiters::wake_progress`] for what counts as progress and why the
+    /// current task's own registration is left in place.
+    fn wake_progress(&self, cx: &Context<'_>) {
+        self.waiters.wake_progress(cx);
     }
 
     // --- ciphertext buffers -------------------------------------------------
@@ -532,7 +654,7 @@ where
                 if let Err(e) = self.collect_outbound() {
                     return Poll::Ready(Err(e));
                 }
-                return match self.poll_drain_outbound(cx) {
+                return match self.poll_drain_outbound(cx, Side::Write) {
                     Poll::Ready(Ok(())) => {
                         self.wake_progress(cx);
                         Poll::Ready(Ok(()))
@@ -549,7 +671,7 @@ where
                 if let Err(e) = self.collect_outbound() {
                     return Poll::Ready(Err(e));
                 }
-                match self.poll_drain_outbound(cx) {
+                match self.poll_drain_outbound(cx, Side::Write) {
                     Poll::Ready(Ok(())) => continue,
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Pending => {
@@ -568,7 +690,7 @@ where
             if let Err(e) = self.collect_outbound() {
                 return Poll::Ready(Err(e));
             }
-            if let Poll::Ready(Err(e)) = self.poll_drain_outbound(cx) {
+            if let Poll::Ready(Err(e)) = self.poll_drain_outbound(cx, Side::Write) {
                 return Poll::Ready(Err(e));
             }
 
@@ -593,9 +715,15 @@ where
     /// Push the backlog at the transport until it is empty or the transport
     /// stops taking bytes.
     ///
+    /// `side` is the direction whose task is doing the pushing. Its waker is
+    /// registered *before* the transport is polled, not after a `Pending`
+    /// return: the transport is given the stream's stable write waker rather
+    /// than this task's, so a readiness wake arriving between the poll and the
+    /// return would otherwise find no slot to deliver into and be lost.
+    ///
     /// Byte movement is observable progress, so retained waiters are woken even
     /// when the drain ultimately parks or fails.
-    fn poll_drain_outbound(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+    fn poll_drain_outbound(&mut self, cx: &mut Context<'_>, side: Side) -> Poll<Result<(), Error>> {
         let mut moved = false;
 
         let outcome = loop {
@@ -604,8 +732,10 @@ where
                 self.outbound_offset = 0;
                 break Poll::Ready(Ok(()));
             }
+            self.waiters.register(side, cx);
+            let mut ready = Context::from_waker(&self.write_ready);
             match Pin::new(&mut self.transport)
-                .poll_write(cx, &self.outbound[self.outbound_offset..])
+                .poll_write(&mut ready, &self.outbound[self.outbound_offset..])
             {
                 Poll::Pending => break Poll::Pending,
                 Poll::Ready(Ok(0)) => {
@@ -629,13 +759,34 @@ where
         outcome
     }
 
+    /// Flush the transport itself, on the write direction's behalf.
+    ///
+    /// Same registration rule as [`Self::poll_drain_outbound`]: the transport
+    /// sees the stream's stable waker, so this task's own must already be in
+    /// its slot when the poll happens.
+    fn poll_transport_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        self.register_write_waiter(cx);
+        let mut ready = Context::from_waker(&self.write_ready);
+        Pin::new(&mut self.transport)
+            .poll_flush(&mut ready)
+            .map_err(Error::Transport)
+    }
+
+    /// Shut the transport's write direction down. Registration as above.
+    fn poll_transport_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        self.register_write_waiter(cx);
+        let mut ready = Context::from_waker(&self.write_ready);
+        Pin::new(&mut self.transport)
+            .poll_shutdown(&mut ready)
+            .map_err(Error::Transport)
+    }
+
     /// Drain the backlog on behalf of a *read*.
     ///
     /// Two rules distinguish this from [`Self::poll_drain_outbound`], and both
     /// exist so a read reports only read-side outcomes. A transport failure is
-    /// latched for the write direction rather than returned, and a transport
-    /// that is not ready costs the writer its registration, so the writer is
-    /// woken to reclaim it.
+    /// latched for the write direction rather than returned, and the drain
+    /// never parks the read on write readiness alone.
     ///
     /// A third rule is the skip guard. Once the write direction is closing or
     /// has failed terminally, a read must not touch the transport's write side
@@ -652,19 +803,15 @@ where
         if self.outbound_len() == 0 {
             return Drain::Complete;
         }
-        match self.poll_drain_outbound(cx) {
+        match self.poll_drain_outbound(cx, Side::Read) {
             Poll::Ready(Ok(())) => Drain::Complete,
             Poll::Ready(Err(e)) => {
                 if self.pending_write_error.is_none() {
                     self.pending_write_error = Some(e);
                 }
-                self.wake_writer();
                 Drain::Failed
             }
-            Poll::Pending => {
-                self.wake_writer();
-                Drain::Pending
-            }
+            Poll::Pending => Drain::Pending,
         }
     }
 
@@ -879,7 +1026,7 @@ where
         if let Err(e) = self.collect_outbound() {
             return self.fail_write(WriteFailure::Tls, e);
         }
-        match self.poll_drain_outbound(cx) {
+        match self.poll_drain_outbound(cx, Side::Write) {
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => {
                 // Prior ciphertext is still queued, so OpenSSL is not entered
@@ -920,7 +1067,7 @@ where
                     // has already taken these bytes, so anything but
                     // `Ready(Ok(n))` would lose them. A transport failure is
                     // latched for the next write-side call instead of dropped.
-                    match self.poll_drain_outbound(cx) {
+                    match self.poll_drain_outbound(cx, Side::Write) {
                         Poll::Ready(Ok(())) | Poll::Pending => {}
                         Poll::Ready(Err(e)) => {
                             if self.pending_write_error.is_none() {
@@ -972,7 +1119,7 @@ where
             self.write_failure = Some(WriteFailure::Tls);
             return Poll::Ready(Err(e));
         }
-        match self.poll_drain_outbound(cx) {
+        match self.poll_drain_outbound(cx, Side::Write) {
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => {
                 self.register_write_waiter(cx);
@@ -980,12 +1127,9 @@ where
             }
             Poll::Ready(Ok(())) => {}
         }
-        match Pin::new(&mut self.transport).poll_flush(cx) {
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::Transport(e))),
-            Poll::Pending => {
-                self.register_write_waiter(cx);
-                return Poll::Pending;
-            }
+        match self.poll_transport_flush(cx) {
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
             Poll::Ready(Ok(())) => {}
         }
 
@@ -1018,7 +1162,7 @@ where
                         self.write_failure = Some(WriteFailure::Tls);
                         return Poll::Ready(Err(e));
                     }
-                    match self.poll_drain_outbound(cx) {
+                    match self.poll_drain_outbound(cx, Side::Write) {
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         Poll::Pending => {
                             self.register_write_waiter(cx);
@@ -1050,7 +1194,7 @@ where
                     self.wake_progress(cx);
                 }
                 ShutdownState::TlsClosed => {
-                    match self.poll_drain_outbound(cx) {
+                    match self.poll_drain_outbound(cx, Side::Write) {
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         Poll::Pending => {
                             self.register_write_waiter(cx);
@@ -1058,12 +1202,9 @@ where
                         }
                         Poll::Ready(Ok(())) => {}
                     }
-                    match Pin::new(&mut self.transport).poll_flush(cx) {
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::Transport(e))),
-                        Poll::Pending => {
-                            self.register_write_waiter(cx);
-                            return Poll::Pending;
-                        }
+                    match self.poll_transport_flush(cx) {
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
                         Poll::Ready(Ok(())) => {}
                     }
                     self.shutdown_state = ShutdownState::TransportFlushed;
@@ -1071,12 +1212,9 @@ where
                 ShutdownState::TransportFlushed => {
                     // Whether this leaves the read half usable is the
                     // transport's contract, not this crate's.
-                    match Pin::new(&mut self.transport).poll_shutdown(cx) {
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::Transport(e))),
-                        Poll::Pending => {
-                            self.register_write_waiter(cx);
-                            return Poll::Pending;
-                        }
+                    match self.poll_transport_shutdown(cx) {
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
                         Poll::Ready(Ok(())) => {}
                     }
                     self.shutdown_state = ShutdownState::Done;
@@ -1171,23 +1309,5 @@ where
         self.get_mut()
             .poll_shutdown_impl(cx)
             .map(|result| result.map_err(io::Error::from))
-    }
-}
-
-/// Store `cx`'s waker, reusing the existing one when it is equivalent.
-fn register(slot: &mut Option<Waker>, cx: &Context<'_>) {
-    match slot {
-        Some(existing) if existing.will_wake(cx.waker()) => {}
-        _ => *slot = Some(cx.waker().clone()),
-    }
-}
-
-/// Wake a retained waker unless it belongs to the task doing the waking.
-fn wake_other(slot: &mut Option<Waker>, cx: &Context<'_>) {
-    let Some(waker) = slot.take() else {
-        return;
-    };
-    if !waker.will_wake(cx.waker()) {
-        waker.wake();
     }
 }

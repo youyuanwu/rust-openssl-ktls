@@ -29,11 +29,17 @@ use common::certs;
 use common::tokio_memory::{Controls, Event, MemoryStream, StatsHandle, duplex};
 use openssl_io::tokio::SslStream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::sync::Notify;
 use tokio::time::timeout;
 
 /// Long enough that a working implementation never reaches it, short enough
 /// that a broken one fails quickly.
 const LIMIT: Duration = Duration::from_secs(5);
+
+/// The budget for waiting on one specific wakeup, deliberately shorter than
+/// [`LIMIT`] so a lost wake is reported by the assertion that names it rather
+/// than by the enclosing timeout.
+const WAKE_LIMIT: Duration = Duration::from_secs(2);
 
 type Stream = SslStream<MemoryStream>;
 
@@ -119,6 +125,52 @@ impl Wake for CountingWaker {
 
 fn counting_waker() -> (Arc<CountingWaker>, Waker) {
     let inner = Arc::new(CountingWaker(AtomicUsize::new(0)));
+    let waker = Waker::from(inner.clone());
+    (inner, waker)
+}
+
+/// A counting waker a test can *wait* on.
+///
+/// Asserting a counter immediately after an action proves a wake was delivered
+/// synchronously, which is all the schedules above need. A schedule that must
+/// prove a wake is delivered *at all* needs to block until it arrives, or a
+/// lost wakeup would read as "not yet". `Notify::notify_one` stores a permit
+/// when nobody is waiting, so the wait cannot miss a wake that already
+/// happened.
+struct SignalWaker {
+    count: AtomicUsize,
+    notify: Notify,
+}
+
+impl SignalWaker {
+    fn count(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+
+    /// Wait for the next wake, or fail the test if none arrives in time.
+    async fn woken(&self, what: &str) {
+        timeout(WAKE_LIMIT, self.notify.notified())
+            .await
+            .unwrap_or_else(|_| panic!("{what}"));
+    }
+}
+
+impl Wake for SignalWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        self.notify.notify_one();
+    }
+}
+
+fn signal_waker() -> (Arc<SignalWaker>, Waker) {
+    let inner = Arc::new(SignalWaker {
+        count: AtomicUsize::new(0),
+        notify: Notify::new(),
+    });
     let waker = Waker::from(inner.clone());
     (inner, waker)
 }
@@ -226,13 +278,15 @@ async fn schedule_one_inbound_data_wakes_the_reader_and_not_the_writer() {
 }
 
 /// SC-009, schedule 2. A write parks registering waker B; a read is polled
-/// afterwards and takes the transport's single write slot; the gate then
+/// afterwards and also touches the transport's write side; the gate then
 /// reopens.
 ///
-/// B is the waker that must fire, and D-E allows it to fire *early*: the read
-/// poll's write-side handoff wakes the writer precisely so it can re-register
-/// its own waker before the reader can be cancelled out from under it. Both
-/// wakes are asserted, in order, and the write then completes.
+/// B is the waker that must fire, and it must fire *without the writer being
+/// re-polled first*. That is the whole point of the stable transport-write
+/// waker: the intervening read registers nothing of its own on the transport's
+/// write side, so B's registration is still live when readiness arrives. A poll
+/// that moves no bytes is required to wake nobody, so the read poll itself must
+/// leave both counters alone.
 #[tokio::test]
 async fn schedule_two_the_parked_writer_is_woken_and_the_write_completes() {
     timeout(LIMIT, async {
@@ -252,30 +306,29 @@ async fn schedule_two_the_parked_writer_is_woken_and_the_write_completes() {
         park_write(&mut pair.client, &mut cx_b, second);
         assert_eq!(b.count(), 0, "parking must not wake immediately");
 
-        // The read's mandatory backlog drain polls the transport's write side,
-        // finds it not ready, and therefore overwrites B's registration there.
-        // Nothing moves in either direction during that poll, so the only thing
-        // that can wake B is the ownership handoff itself.
+        // The read's mandatory backlog drain polls the transport's write side
+        // and finds it not ready. Nothing moves in either direction during that
+        // poll, so nothing may be woken by it either.
         pair.client_stats.reset();
         park_read(&mut pair.client, &mut cx_a);
         assert_made_no_progress(&pair.client_stats);
-        assert!(
-            b.count() >= 1,
-            "the read took the transport's write slot without handing it back \
-             to the parked writer"
-        );
         assert_eq!(a.count(), 0, "the reader woke itself");
+        assert_eq!(
+            b.count(),
+            0,
+            "a poll that moved no bytes woke the parked writer"
+        );
 
-        // The writer does what that wake exists to make it do: re-poll and
-        // reclaim the slot.
-        let handoff = b.count();
-        park_write(&mut pair.client, &mut cx_b, second);
-        assert_eq!(b.count(), handoff, "re-registering must not wake");
-
+        // Readiness arrives with the writer still parked exactly where it was:
+        // it was never re-polled, so only a registration the read could not
+        // displace can deliver this wake. Counted as a delta, so an earlier
+        // stray wake could not stand in for this one.
+        let before = b.count();
         pair.client_controls.open_write_gate();
         assert!(
-            b.count() > handoff,
-            "reopening the transport did not wake the writer that reclaimed it"
+            b.count() > before,
+            "the read displaced the parked writer's claim on transport write \
+             readiness"
         );
 
         // The write completes, and both payloads arrive in order.
@@ -297,14 +350,14 @@ async fn schedule_two_the_parked_writer_is_woken_and_the_write_completes() {
     .expect("schedule 2 timed out");
 }
 
-/// The waker-theft regression. A reader takes the transport's single write slot
-/// from a parked writer and is then cancelled.
+/// The waker-theft regression, reader-cancelled direction. A reader touches the
+/// transport's write side after a writer parked on it, and is then cancelled.
 ///
-/// Without the ownership handoff the transport would be left holding the dead
-/// reader's waker, and reopening it would wake nobody: the writer would hang
-/// with its ciphertext queued. The handoff wake is what makes the writer
-/// re-register in time, so it is asserted directly rather than inferred from
-/// the write eventually completing.
+/// If the reader's own waker could reach the transport's single write slot, the
+/// transport would be left holding a dead task's waker and reopening it would
+/// wake nobody: the writer would hang with its ciphertext queued. The writer is
+/// deliberately *not* re-polled between the cancellation and the reopening, so
+/// only a registration the reader could never displace can carry the wake.
 #[tokio::test]
 async fn dropping_a_reader_cannot_strand_a_parked_writer() {
     timeout(LIMIT, async {
@@ -323,7 +376,8 @@ async fn dropping_a_reader_cannot_strand_a_parked_writer() {
         park_write(&mut pair.client, &mut cx_b, second);
         assert_eq!(b.count(), 0);
 
-        // A reader steals the slot and is then cancelled outright.
+        // A reader polls the same transport write side and is then cancelled
+        // outright.
         let (a, waker_a) = counting_waker();
         pair.client_stats.reset();
         {
@@ -334,18 +388,19 @@ async fn dropping_a_reader_cannot_strand_a_parked_writer() {
             // Dropped here, unpolled again: the waker it left behind is dead.
         }
         assert_made_no_progress(&pair.client_stats);
-        assert!(
-            b.count() >= 1,
-            "the cancelled reader took the transport's write slot with it"
+        assert_eq!(
+            b.count(),
+            0,
+            "a poll that moved no bytes woke the parked writer"
         );
         assert_eq!(a.count(), 0);
 
-        // The writer reclaims the slot, and reopening reaches it.
-        let handoff = b.count();
-        park_write(&mut pair.client, &mut cx_b, second);
+        // Reopening reaches the writer even though it never re-registered.
+        // Counted as a delta, so an earlier stray wake cannot stand in for it.
+        let before = b.count();
         pair.client_controls.open_write_gate();
         assert!(
-            b.count() > handoff,
+            b.count() > before,
             "the reopened transport woke the dropped reader instead of the writer"
         );
 
@@ -526,4 +581,98 @@ async fn a_poll_that_makes_no_progress_wakes_nothing() {
     })
     .await
     .expect("the anti-livelock check timed out");
+}
+
+/// The waker-theft regression, writer-cancelled direction: the mirror image of
+/// `dropping_a_reader_cannot_strand_a_parked_writer`, and the sequence that
+/// FR-011b and FR-025 together forbid.
+///
+/// 1. A successful write leaves ciphertext queued behind a closed gate.
+/// 2. A read polls, tries to drain that ciphertext, and parks with waker A.
+/// 3. A *later* write polls with waker B and is then cancelled.
+/// 4. The gate reopens with nothing inbound injected.
+///
+/// The only task that can move the session on now is the reader: it holds the
+/// backlog the peer is waiting for, and the peer cannot reply until the backlog
+/// arrives. So if step 3 could displace step 2's claim on transport write
+/// readiness, step 4 would wake a dead task and the request would be stranded
+/// forever — a genuine deadlock, not a slow path.
+///
+/// Nothing is injected inbound and the reader is never re-polled by hand: the
+/// wait below returns only if the stream itself woke waker A.
+#[tokio::test]
+async fn a_cancelled_writer_cannot_strand_a_parked_reader() {
+    timeout(LIMIT, async {
+        let mut pair = connected().await;
+        pair.client_controls.close_write_gate();
+
+        // 1. The request is accepted by TLS but cannot reach the wire.
+        let request = b"the request whose reply the reader is waiting for";
+        assert_eq!(
+            pair.client.write(request).await.expect("the request write"),
+            request.len()
+        );
+        assert_eq!(
+            pair.client_controls.queued_for_peer(),
+            0,
+            "the gate let the request through, so nothing is stranded"
+        );
+
+        // 2. The reader parks. Its drain of that backlog is the only reason it
+        //    has any interest in transport write readiness.
+        let (a, waker_a) = signal_waker();
+        let mut cx_a = Context::from_waker(&waker_a);
+        pair.client_stats.reset();
+        park_read(&mut pair.client, &mut cx_a);
+        assert_eq!(a.count(), 0, "parking must not wake immediately");
+
+        // 3. A later write parks behind the same gate and is dropped where it
+        //    stands, leaving a dead waker behind.
+        let (b, waker_b) = counting_waker();
+        {
+            let mut write = Box::pin(pair.client.write(b"a write that is abandoned"));
+            let polled = write.as_mut().poll(&mut Context::from_waker(&waker_b));
+            assert!(polled.is_pending(), "the gated write must park");
+        }
+        assert_eq!(b.count(), 0, "parking must not wake immediately");
+        assert_made_no_progress(&pair.client_stats);
+
+        // 4. Transport write readiness, and nothing else: no inbound data, no
+        //    re-poll of anything.
+        pair.client_controls.open_write_gate();
+        a.woken(
+            "the cancelled writer took the parked reader's claim on transport \
+             write readiness with it: the request is stranded and the reader \
+             will never wake",
+        )
+        .await;
+
+        // And the exchange completes: the stranded request reaches the peer and
+        // the reply comes back.
+        let reply = b"the reply that could not exist while the request was stuck";
+        let (got, ()) = timeout(LIMIT, async {
+            tokio::join!(
+                async {
+                    let mut buf = [0u8; 128];
+                    let n = pair.client.read(&mut buf).await.expect("the resumed read");
+                    buf[..n].to_vec()
+                },
+                async {
+                    let mut got = vec![0u8; request.len()];
+                    pair.server
+                        .read_exact(&mut got)
+                        .await
+                        .expect("the peer never received the request");
+                    assert_eq!(got, request, "the peer received the wrong request");
+                    pair.server.write_all(reply).await.unwrap();
+                    pair.server.flush().await.unwrap();
+                }
+            )
+        })
+        .await
+        .expect("the request/reply exchange timed out");
+        assert_eq!(got, reply, "the reader did not receive the peer's reply");
+    })
+    .await
+    .expect("the cancelled-writer regression timed out");
 }
