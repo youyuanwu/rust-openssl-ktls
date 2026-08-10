@@ -72,3 +72,8 @@ required-features = ["compio"]
 name = "tokio_transport"
 path = "tests/tokio_transport.rs"
 required-features = ["tokio"]
+
+[[test]]
+name = "tokio_in_memory"
+path = "tests/tokio_in_memory.rs"
+required-features = ["tokio"]
