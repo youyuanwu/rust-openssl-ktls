@@ -24,11 +24,21 @@ use crate::ffi::BioPair;
 /// typical record round-trips without repeated pumping, small enough that a
 /// stalled peer cannot make us buffer without bound — which is precisely why
 /// this crate uses a BIO pair rather than a memory BIO.
-const PAIR_BUF: usize = 4 * MAX_RECORD;
+///
+/// Visible to the adapters so a runtime pump can assert its own ciphertext
+/// backlog is at least large enough to absorb a completely full pair.
+pub(crate) const PAIR_BUF: usize = 4 * MAX_RECORD;
 
 /// `SSL3_RT_MAX_PLAIN_LENGTH`: the most plaintext OpenSSL will accept in one
 /// `SSL_write_ex` call. Measured, not assumed — see `docs/CompioStream.md`.
 pub(crate) const MAX_RECORD: usize = 16384;
+
+/// Size of the crate-owned ciphertext buffers moved to and from the transport.
+///
+/// It lives here, beside [`MAX_RECORD`], rather than in a runtime adapter,
+/// because every adapter stages ciphertext and none should have to depend on
+/// another runtime's feature-gated module to learn how much to stage.
+pub(crate) const CIPHER_CHUNK: usize = 16 * 1024;
 
 /// Which side of the handshake to drive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,7 +172,13 @@ impl TlsEngine {
     }
 
     /// True when a byte-identical `SSL_write_ex` retry is outstanding.
-    #[cfg(test)]
+    ///
+    /// Available to debug builds as well as tests because a readiness-based
+    /// adapter cannot afford to park a write while OpenSSL is owed a retry —
+    /// the next poll may legitimately arrive with a different buffer, which
+    /// OpenSSL rejects permanently. Asserting the invariant is only useful
+    /// where assertions run, so the predicate is compiled where they do.
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn retry_owed(&self) -> bool {
         self.retry_owed
     }
@@ -255,13 +271,20 @@ impl TlsEngine {
         if self.state == State::Failed {
             return Err(Error::tls());
         }
-        debug_assert!(
-            !self.retry_owed || self.retry_len == data.len(),
-            "SSL_write_ex retry must present the identical buffer it was first given \
-             (owed {} bytes, got {})",
-            self.retry_len,
-            data.len()
-        );
+        // Gated as a block rather than written as a bare `debug_assert!`: the
+        // predicate itself only exists where assertions run, and a
+        // `debug_assert!` would still type-check its argument in a build with
+        // assertions off.
+        #[cfg(debug_assertions)]
+        {
+            assert!(
+                !self.retry_owed() || self.retry_len == data.len(),
+                "SSL_write_ex retry must present the identical buffer it was first given \
+                 (owed {} bytes, got {})",
+                self.retry_len,
+                data.len()
+            );
+        }
 
         let mut put = 0usize;
         // SAFETY: `data` is valid for `data.len()` bytes; `put` is a live local.

@@ -1,4 +1,4 @@
-//! Experimental completion-based async OpenSSL stream for the [compio] runtime.
+//! Experimental async OpenSSL streams built on a runtime-neutral TLS engine.
 //!
 //! # Status
 //!
@@ -6,10 +6,17 @@
 //! and it is Linux-only. Kernel TLS offload is explicitly out of scope — see the
 //! sibling `openssl-ktls` crate for that.
 //!
-//! Concurrent split halves, interoperability testing against an independent TLS
-//! implementation, renegotiation, post-handshake key update, and
-//! sanitizer-instrumented runs are **not yet implemented**. See
-//! `docs/CompioStream.md` for what that leaves and why.
+//! Both bindings support the handshake in either role, plaintext transfer,
+//! flush, TLS shutdown, session inspection, guarded transport recovery, and
+//! classified errors. Not implemented in either: peer-initiated renegotiation,
+//! post-handshake key update, interoperability with a TLS library other than
+//! OpenSSL, and sanitizer-instrumented runs. The compio binding additionally
+//! has no concurrent split halves; the tokio binding gets those from
+//! `tokio::io::split`. See [`docs/CompioStream.md`] and [`docs/TokioStream.md`]
+//! for what that leaves and why.
+//!
+//! [`docs/CompioStream.md`]: https://github.com/youyuanwu/rust-openssl-ktls/blob/main/docs/CompioStream.md
+//! [`docs/TokioStream.md`]: https://github.com/youyuanwu/rust-openssl-ktls/blob/main/docs/TokioStream.md
 //!
 //! # Why it exists
 //!
@@ -19,112 +26,72 @@
 //! the caller submits a buffer the kernel takes ownership of and returns only
 //! once the transfer has finished.
 //!
-//! This crate provides a TLS stream that speaks that ownership-passing
-//! vocabulary directly, so an application already committed to such a runtime
-//! does not need a second, readiness-based runtime purely for its TLS layer.
+//! This crate began as a TLS stream speaking that ownership-passing vocabulary
+//! directly, so an application already committed to such a runtime does not
+//! need a second, readiness-based runtime purely for its TLS layer. It now also
+//! provides a readiness-based binding, driven by the *same* synchronous TLS
+//! state machine — which is the point: the hard part of TLS correctness is
+//! written and tested once, regardless of which async model an application
+//! picks.
 //!
-//! # Usage
+//! # Selecting a runtime
 //!
-//! The stream is generic over the transport, which is supplied as a reading and
-//! a writing half. compio's `TcpStream` and `UnixStream` split into halves
-//! directly; anything else can be split with `compio_io::split`.
+//! The TLS state machine is synchronous and runtime-neutral; only the transport
+//! pump differs. Each pump lives behind its own Cargo feature, and both are
+//! enabled by default:
 //!
-//! Connecting as a client:
+//! | Feature | Module | Binding |
+//! |---|---|---|
+//! | `compio` | [`compio`] | completion-based, for [compio] |
+//! | `tokio` | [`tokio`] | readiness-based, for [tokio] |
 //!
-//! ```no_run
-//! use compio_io::AsyncWriteExt;
-//! use openssl::ssl::{SslConnector, SslMethod};
-//! use openssl_io::SslStream;
+//! Turning default features off and selecting one keeps the other runtime's
+//! packages out of the dependency graph entirely. Usage examples, caller
+//! constraints, and design notes are runtime-specific and live in each module's
+//! own documentation.
 //!
-//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let tcp = compio::net::TcpStream::connect("example.com:4433").await?;
-//! let (read_half, write_half) = tcp.into_split();
+//! # How the two bindings differ
 //!
-//! // `configure().into_ssl(domain)` is what sets SNI and hostname
-//! // verification. Building an `Ssl` straight from the context skips both, so
-//! // a certificate trusted for some *other* host would be accepted.
-//! let connector = SslConnector::builder(SslMethod::tls())?.build();
-//! let ssl = connector.configure()?.into_ssl("example.com")?;
+//! The async models are not interchangeable, and these differences are forced
+//! by them rather than chosen. A caller moving between the bindings should read
+//! this list.
 //!
-//! let mut stream = SslStream::new(ssl, read_half, write_half)?;
-//! stream.connect().await?;
-//!
-//! stream.write_all(b"GET / HTTP/1.0\r\n\r\n".to_vec()).await.0?;
-//! stream.close().await?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! Accepting as a server:
-//!
-//! ```no_run
-//! use compio_io::AsyncRead;
-//! use openssl::ssl::Ssl;
-//! use openssl_io::SslStream;
-//!
-//! # async fn run(acceptor: openssl::ssl::SslAcceptor) -> Result<(), Box<dyn std::error::Error>> {
-//! let listener = compio::net::TcpListener::bind("127.0.0.1:0").await?;
-//! let (tcp, _peer) = listener.accept().await?;
-//! let (read_half, write_half) = tcp.into_split();
-//!
-//! let ssl = Ssl::new(acceptor.context())?;
-//! let mut stream = SslStream::new(ssl, read_half, write_half)?;
-//! stream.accept().await?;
-//!
-//! let buf = Vec::with_capacity(4096);
-//! let compio_buf::BufResult(n, _buf) = stream.read(buf).await;
-//! println!("{} plaintext bytes", n?);
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! # Constraints callers must observe
-//!
-//! - **One operation at a time.** The stream takes `&mut self`, so a read and a
-//!   write cannot overlap. Full-duplex use needs split halves, which are not yet
-//!   implemented.
-//! - **Writes may be partial.** A single `SSL_write_ex` accepts at most one TLS
-//!   record (16 KiB), so a larger write returns a partial count and the caller
-//!   resubmits the remainder. A reported count always means that much ciphertext
-//!   has reached the transport.
-//! - **Abandoning a write is indeterminate.** Dropping a write future — on a
-//!   timeout, say — leaves the session correct and usable, but an unknown
-//!   prefix of the payload may already have been committed, and the count is
-//!   lost with the future. The caller's buffer is forfeited; only ciphertext
-//!   OpenSSL has already produced, or plaintext it is still owed a retry for, is
-//!   retained and completed by the next operation. Anything not yet accepted is
-//!   gone with the future, so a caller that must know what was sent has to
-//!   resynchronize at the application layer. Abandoning a *read* has no such
-//!   caveat.
-//! - **Close explicitly.** Dropping the stream does not send `close_notify`, so
-//!   the peer will see a truncated connection. Call [`SslStream::close`], or
-//!   `shutdown` from compio's `AsyncWrite` trait, which does the same thing.
-//!
-//! # Design
-//!
-//! The stream is transport-agnostic because the TLS engine never touches a
-//! socket: OpenSSL is attached to a BIO pair, and ciphertext is pumped between
-//! that pair and the caller's transport.
-//!
-//! One invariant is structural and holds everywhere: **caller buffers are never
-//! submitted to the transport.** OpenSSL borrows a caller's buffer only during a
-//! synchronous call; everything crossing the runtime boundary is a crate-owned
-//! ciphertext buffer. That, plus keeping in-flight transport operations in the
-//! stream rather than in the returned future, is what makes an abandoned
-//! operation safe.
-//!
-//! `docs/CompioStream.md` covers the rest: why a BIO pair rather than a memory
-//! BIO or a custom `BIO_METHOD`, the BIO ownership split, the staged-write
-//! rules, and the buffer inventory.
+//! - **What a write's count means.** The compio binding reports plaintext only
+//!   once its ciphertext has reached the transport. The tokio binding reports
+//!   plaintext accepted by TLS; delivery is attempted immediately but only
+//!   *guaranteed* after `flush` or `shutdown`. Tokio documents a single-call
+//!   write as cancel-safe, which is incompatible with the stronger promise.
+//!   Residual ciphertext is drained by the next operation in either direction,
+//!   so writing and then reading cannot strand it.
+//! - **Backpressure.** The tokio binding admits new plaintext only when nothing
+//!   is queued, bounding caller-funded ciphertext to a single TLS record; once
+//!   the transport stalls, a write parks rather than buffering further.
+//! - **The handshake is explicit on tokio.** A read or write before `connect`
+//!   or `accept` fails with [`Error::HandshakeRequired`], touching neither the
+//!   caller's buffer nor the transport. The role cannot be inferred.
+//! - **Abandoning an operation.** On tokio it is ordinary: a cancelled pending
+//!   write delivers nothing and a cancelled read loses nothing, because no
+//!   caller buffer is held across a poll. On compio an abandoned write is
+//!   indeterminate and forfeits its buffer.
+//! - **Half-shutdown.** Whether shutting the write side down leaves reads
+//!   usable is determined by the transport. `tokio::net::TcpStream` and the
+//!   in-memory duplex both preserve reads; a transport that closes both
+//!   directions gets that behaviour instead.
+//! - **Concurrency.** `tokio::io::split` gives the tokio binding independent
+//!   halves. The compio binding takes `&mut self`, so operations cannot overlap.
 //!
 //! [compio]: https://docs.rs/compio
+//! [tokio]: https://docs.rs/tokio
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod engine;
 mod error;
 mod ffi;
-mod stream;
+
+#[cfg(feature = "compio")]
+pub mod compio;
+#[cfg(feature = "tokio")]
+pub mod tokio;
 
 pub use error::Error;
-pub use stream::SslStream;

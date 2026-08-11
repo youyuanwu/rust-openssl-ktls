@@ -4,15 +4,32 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 license = "MIT"
-description = "Experimental completion-based (compio) async OpenSSL stream"
+description = "Experimental async OpenSSL streams for compio and tokio, sharing one TLS engine"
 
 [dependencies]
 openssl = { workspace = true, features = [], default-features = false }
 openssl-sys = { workspace = true, features = [], default-features = false }
 foreign-types-shared.workspace = true
-compio-io.workspace = true
-compio-buf.workspace = true
+compio-io = { workspace = true, optional = true }
+compio-buf = { workspace = true, optional = true }
+# Declared directly rather than with `workspace = true`, deliberately. Cargo
+# unions features across a workspace dependency, so inheriting the workspace
+# entry would also inherit whatever the other members ask for. The library needs
+# no tokio feature at all — `AsyncRead`, `AsyncWrite`, and `ReadBuf` are ungated
+# — and this crate's normal graph is meant to stay that minimal.
+tokio = { version = "1", default-features = false, optional = true }
 
+[features]
+default = ["compio", "tokio"]
+# The completion-based binding: `openssl_io::compio::SslStream`.
+compio = ["dep:compio-io", "dep:compio-buf"]
+# The readiness-based binding: `openssl_io::tokio`.
+tokio = ["dep:tokio"]
+
+# Cargo cannot mark a dev-dependency optional, so everything below is resolved
+# and built for *any* `cargo test` invocation regardless of the selected
+# features. Only `required-features` on the `[[test]]` targets decides which
+# test binaries are compiled and run.
 [dev-dependencies]
 # The umbrella crate is test-only: it supplies the runtime, `#[compio::test]`,
 # TcpStream, and timeouts. Its defaults (runtime, io-uring) are all needed.
@@ -20,3 +37,58 @@ compio-buf.workspace = true
 # where io_uring is unavailable fails outright instead of degrading
 # (compio-driver fusion only falls back when both backends are compiled in).
 compio = { workspace = true, features = ["net", "macros", "time", "polling"] }
+# The tokio tests need far more of tokio than the library does: the runtime and
+# `#[tokio::test]`, `io-util` for `split`/`duplex` and the `Ext` traits, `net`
+# for a real socket, `time` for bounded timeouts, and `sync` for test signalling.
+tokio = { workspace = true, features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+], default-features = false }
+# An independently implemented OpenSSL-backed tokio TLS stream, used as the
+# interoperability peer.
+tokio-openssl.workspace = true
+
+[[test]]
+name = "in_memory"
+path = "tests/in_memory.rs"
+required-features = ["compio"]
+
+[[test]]
+name = "tcp"
+path = "tests/tcp.rs"
+required-features = ["compio"]
+
+[[test]]
+name = "transport"
+path = "tests/transport.rs"
+required-features = ["compio"]
+
+[[test]]
+name = "tokio_transport"
+path = "tests/tokio_transport.rs"
+required-features = ["tokio"]
+
+[[test]]
+name = "tokio_in_memory"
+path = "tests/tokio_in_memory.rs"
+required-features = ["tokio"]
+
+[[test]]
+name = "tokio_wakers"
+path = "tests/tokio_wakers.rs"
+required-features = ["tokio"]
+
+[[test]]
+name = "tokio_tcp"
+path = "tests/tokio_tcp.rs"
+required-features = ["tokio"]
+
+[[test]]
+name = "tokio_interop"
+path = "tests/tokio_interop.rs"
+required-features = ["tokio"]

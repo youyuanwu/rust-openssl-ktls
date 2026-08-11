@@ -11,7 +11,7 @@ use common::certs;
 use compio::net::{TcpListener, TcpStream};
 use compio_buf::BufResult;
 use compio_io::{AsyncRead, AsyncWrite};
-use openssl_io::SslStream;
+use openssl_io::compio::SslStream;
 
 /// Drive two futures to completion together.
 async fn join<A, B>(a: A, b: B) -> (A::Output, B::Output)

@@ -47,6 +47,29 @@ pub(crate) struct BioPair {
     app_side: *mut openssl_sys::BIO,
 }
 
+// SAFETY: `BioPair` owns its raw BIO pointers exclusively.
+//
+// - Both pointers come from `BIO_new_bio_pair`, which yields fresh objects with
+//   no other owner, and neither is ever copied out to be retained elsewhere:
+//   `ssl_side()` hands its pointer straight to `SSL_set_bio` and `app_side` is
+//   never exposed at all.
+// - Moving a `BioPair` transfers that exclusive ownership wholesale. It creates
+//   no additional reference, so no two threads can reach the same BIO through
+//   it.
+// - After `SSL_set_bio`, `take_ssl_side` nulls the SSL-side pointer, so from
+//   that moment the only owner of that half is the `Ssl` object — and
+//   `openssl::ssl::Ssl` is itself already `Send + Sync`, so moving the pair and
+//   the session together is exactly as sound as moving the session alone.
+// - OpenSSL's own locking is irrelevant here because nothing is shared: the
+//   value is used only through `&self`/`&mut self` from whichever single thread
+//   currently owns it.
+//
+// `Sync` is deliberately NOT implemented. `&BioPair` would let two threads call
+// `BIO_read`/`BIO_write` on the same unsynchronized BIO concurrently, and the
+// crate never needs to share a pair by reference — the engine that owns it is
+// moved, not shared.
+unsafe impl Send for BioPair {}
+
 impl BioPair {
     /// Create a pair with `buf_size` bytes of buffering in each direction.
     pub(crate) fn new(buf_size: usize) -> Option<Self> {
@@ -169,6 +192,22 @@ mod tests {
     #[test]
     fn pair_is_created() {
         assert!(BioPair::new(BUF).is_some());
+    }
+
+    /// The engine has to be movable between spawned tasks, which is what the
+    /// `unsafe impl Send for BioPair` above exists for. Instantiating these
+    /// bounds *is* the assertion: the test fails to compile if either type
+    /// stops being `Send`.
+    ///
+    /// There is deliberately no `Sync` assertion. `BioPair` must **not** be
+    /// `Sync`, and proving a negative auto-trait bound would mean taking on a
+    /// dependency for the sake of one check.
+    #[test]
+    fn bio_pair_and_engine_are_send() {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<BioPair>();
+        assert_send::<crate::engine::TlsEngine>();
     }
 
     /// The whole reason for choosing a pair over `BIO_s_mem`: a bounded buffer

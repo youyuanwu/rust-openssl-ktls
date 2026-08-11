@@ -48,19 +48,19 @@ jobs:
         openssl version -a
 
     - name: Run cargo check
-      run: cargo +${{ matrix.rust }} check --locked
+      run: cargo +${{ matrix.rust }} check --locked --all-features
 
     - name: Run cargo fmt
       run: cargo +${{ matrix.rust }} fmt --all -- --check
 
     - name: Run cargo clippy
-      run: cargo +${{ matrix.rust }} clippy --locked --all-targets -- -D warnings
+      run: cargo +${{ matrix.rust }} clippy --locked --all-targets --all-features -- -D warnings
 
     - name: Run cargo test
-      run: cargo +${{ matrix.rust }} test --locked --all -- --nocapture
+      run: cargo +${{ matrix.rust }} test --locked --all --all-features -- --nocapture
 
     - name: Run llvm-cov
-      run: cargo +${{ matrix.rust }} llvm-cov --locked --codecov --output-path codecov.json --ignore-filename-regex openssl-ktls-tests.*
+      run: cargo +${{ matrix.rust }} llvm-cov --locked --all-features --codecov --output-path codecov.json --ignore-filename-regex openssl-ktls-tests.*
 
     - name: Show cov summary
       run: cargo +${{ matrix.rust }} llvm-cov report --summary-only --ignore-filename-regex openssl-ktls-tests.*
