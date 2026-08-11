@@ -34,8 +34,16 @@ tokio stream has to move into a spawned task; `openssl::ssl::Ssl` is already `Se
 is sound. `Sync` is deliberately *not* implemented — two threads calling `BIO_read`/`BIO_write`
 through a shared reference would be unsound, and nothing in the crate needs it.
 
-A CI step asserts the engine stays runtime-free by rejecting any non-comment line in `engine.rs`
-that mentions a runtime, an async construct, or a feature conditional.
+That the engine stays runtime-free is a property of the source rather than something CI polices:
+no non-comment line in `engine.rs` names a runtime, an async construct, or a feature conditional.
+It can be re-checked at any time with
+
+```sh
+awk '!/^[[:space:]]*\/\// && /compio|tokio|async|await|futures|Poll|runtime|cfg\(feature/' \
+    openssl-io/src/engine.rs
+```
+
+which prints nothing today.
 
 ### One planning assumption was wrong
 
@@ -262,7 +270,24 @@ backlog bound, and half-shutdown over both transports.
 | P5 clean close | `shutdown_sends_close_notify_and_the_peer_sees_sticky_end_of_stream`, `repeated_shutdown_succeeds_without_a_second_close_notify`, `truncation_is_distinct_from_a_clean_end_of_stream` |
 | P6 abandoning an operation | `a_cancelled_pending_write_delivers_none_of_its_own_plaintext`, `a_cancelled_pending_read_loses_no_plaintext`, `repeated_read_and_write_cancellation_keeps_the_session_sound`, `dropping_a_reader_cannot_strand_a_parked_writer`, `a_cancelled_writer_cannot_strand_a_parked_reader` |
 | P7 interoperability | `this_crate_as_client_against_a_tokio_openssl_server`, `this_crate_as_server_against_a_tokio_openssl_client` |
-| P8 selecting one runtime | CI dependency-graph and feature-reachability assertions |
+| P8 selecting one runtime | verified by building each feature selection and inspecting `cargo tree -e normal`; see "Feature selection" below |
+
+### Feature selection
+
+CI builds and tests with every feature enabled, which is the configuration the crate is developed
+in. The single-runtime selections are not exercised on every push; they are checked when the
+dependency wiring changes:
+
+```sh
+cargo test -p openssl-io --locked --no-default-features --features compio
+cargo test -p openssl-io --locked --no-default-features --features tokio
+cargo tree -p openssl-io --locked --no-default-features --features tokio -e normal --prefix none
+cargo tree -p openssl-io --locked --no-default-features --features compio -e normal --prefix none
+```
+
+Each single-feature tree contains only the runtime it selected. The trade is deliberate: an
+unpublished experiment does not need a per-push feature matrix, and the cost of the gap is that a
+dependency edit could reintroduce the other runtime unnoticed until someone runs the above.
 
 The interoperability peer is `tokio-openssl`: an independently written *stream wrapper* over the
 same TLS library. It validates this crate's pump and public behaviour against a separate code path.
