@@ -59,6 +59,41 @@ impl Variant {
     }
 }
 
+/// Which tokio scheduler drives the writer and the drain task.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Flavor {
+    /// Writer and drain share one thread, so a reader wakeup is a task switch rather
+    /// than a cross-core wakeup.
+    CurrentThread,
+    /// Writer and drain can land on separate cores, as in the original measurements.
+    MultiThread,
+}
+
+impl Flavor {
+    const ALL: [Flavor; 2] = [Flavor::CurrentThread, Flavor::MultiThread];
+
+    fn name(self) -> &'static str {
+        match self {
+            Flavor::CurrentThread => "current_thread",
+            Flavor::MultiThread => "multi_thread",
+        }
+    }
+
+    fn build(self) -> tokio::runtime::Runtime {
+        match self {
+            Flavor::CurrentThread => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("bench runtime"),
+            Flavor::MultiThread => tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("bench runtime"),
+        }
+    }
+}
+
 /// An established TLS connection whose client half is the thing under measurement.
 struct Peer {
     client: Box<dyn AsyncWrite + Send + Unpin>,
@@ -200,47 +235,49 @@ async fn build_client(
 }
 
 fn bench_write_throughput(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("bench runtime");
-
     let (cert, key) = mk_self_signed_cert(vec!["localhost".to_string()]).expect("self signed cert");
 
     let mut group = c.benchmark_group("tls_write");
 
-    for variant in Variant::ALL {
-        let peer = match rt.block_on(connect(variant, &cert, &key)) {
-            Some(peer) => Arc::new(Mutex::new(peer)),
-            None => {
-                eprintln!(
-                    "skipping {}: KTLS send not enabled (is the kernel `tls` module loaded?)",
-                    variant.name()
-                );
-                continue;
-            }
-        };
+    for flavor in Flavor::ALL {
+        // A `TcpStream` is bound to the reactor that registered it, so every flavor gets
+        // its own runtime and its own connections.
+        let rt = flavor.build();
 
-        for &size in PAYLOAD_SIZES {
-            let payload = Arc::new(vec![0x5a_u8; size]);
-            group.throughput(Throughput::Bytes(size as u64));
-            group.bench_with_input(BenchmarkId::new(variant.name(), size), &size, |b, _| {
-                b.to_async(&rt).iter(|| {
-                    let peer = peer.clone();
-                    let payload = payload.clone();
-                    async move {
-                        let mut peer = peer.lock().await;
-                        assert!(
-                            !peer.drain.is_finished(),
-                            "drain task stopped; the write below would block forever"
-                        );
-                        peer.client.write_all(&payload).await.expect("write");
-                        // Required for the BufWriter variant; a no-op for the others.
-                        peer.client.flush().await.expect("flush");
-                    }
+        for variant in Variant::ALL {
+            let peer = match rt.block_on(connect(variant, &cert, &key)) {
+                Some(peer) => Arc::new(Mutex::new(peer)),
+                None => {
+                    eprintln!(
+                        "skipping {}_{}: KTLS send not enabled (is the kernel `tls` module loaded?)",
+                        variant.name(),
+                        flavor.name()
+                    );
+                    continue;
+                }
+            };
+            let bench_name = format!("{}_{}", variant.name(), flavor.name());
+
+            for &size in PAYLOAD_SIZES {
+                let payload = Arc::new(vec![0x5a_u8; size]);
+                group.throughput(Throughput::Bytes(size as u64));
+                group.bench_with_input(BenchmarkId::new(&bench_name, size), &size, |b, _| {
+                    b.to_async(&rt).iter(|| {
+                        let peer = peer.clone();
+                        let payload = payload.clone();
+                        async move {
+                            let mut peer = peer.lock().await;
+                            assert!(
+                                !peer.drain.is_finished(),
+                                "drain task stopped; the write below would block forever"
+                            );
+                            peer.client.write_all(&payload).await.expect("write");
+                            // Required for the BufWriter variant; a no-op for the others.
+                            peer.client.flush().await.expect("flush");
+                        }
+                    });
                 });
-            });
+            }
         }
     }
 
