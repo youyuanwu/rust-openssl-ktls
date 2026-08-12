@@ -3,6 +3,43 @@
 `openssl-ktls-tests/benches/write_throughput.rs` measures the cost of OpenSSL's write
 path on an async loopback TLS connection.
 
+## Takeaway: buffered vs unbuffered
+
+Put a `BufWriter` under the TLS stream when you write more than one 16 KiB record at a
+time. It is worth ~2.4x at 1-8 MiB on a multi-thread runtime. Size the capacity to hold
+many records — 1 MiB is what these benchmarks use. 64 KiB is already enough on a
+`current_thread` runtime, but on a multi-thread one the benefit keeps growing to ~256 KiB
+because the reader keeps parking (155 context switches per 8 MiB at 64 KiB, 34 at 1 MiB).
+
+What you are actually paying for without it, per 16 KiB record and *not* per byte:
+
+- **a reader wakeup.** Each `write(2)` pushes on loopback and wakes the peer, which drains
+  it and parks again — ~1 OS context switch per record on a multi-thread runtime.
+- **a trip through the TCP/loopback receive path.** Per packet, not per byte, and packets
+  cannot exceed the 64 KiB GSO ceiling.
+
+Not what you are paying for: syscall entry (~1 us, invisible here), and not the TLS records
+themselves, which stay 16 KiB either way.
+
+Consequences worth knowing:
+
+- **Below one record a `BufWriter` is pure loss** — it adds a memcpy per record and has
+  nothing to batch. Measurably slower when the capacity is too small to hold two records.
+- **The win shrinks to ~1.3x on a `current_thread` runtime**, because half of it was
+  cross-core wakeups that a single-threaded scheduler does not have.
+- **KTLS does not help here.** It moves AES-GCM into the kernel but still emits one
+  `sendmsg` per record, so it does not touch either cost above.
+
+Evidence: [Results](#results), [Current-thread vs multi-thread](#current-thread-vs-multi-thread),
+[Where the context switches come from](#where-the-context-switches-come-from),
+[Is it just the syscall count?](#is-it-just-the-syscall-count).
+
+All of this is measured on loopback with `TCP_NODELAY`, which maximises both costs — a real
+NIC has a 1500-byte MTU and the peer is not on the same host, so the ratios will differ even
+though the record-per-`write(2)` behaviour that causes them does not.
+
+## Running
+
 ```sh
 # whole matrix (slow)
 cargo bench --bench write_throughput
@@ -15,6 +52,9 @@ cargo bench --bench write_throughput -- current_thread
 
 # quick smoke run
 cargo bench --bench write_throughput -- --warm-up-time 1 --measurement-time 2 --sample-size 10
+
+# attribute the cost: syscalls, wakeups, context switches, packets
+cargo run --release --example ctxsw
 ```
 
 ## What is being measured
