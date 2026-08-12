@@ -5,30 +5,47 @@ path on an async loopback TLS connection.
 
 ## Takeaway: buffered vs unbuffered
 
-Put a `BufWriter` under the TLS stream when you write more than one 16 KiB record at a
-time. It is worth ~2.4x at 1-8 MiB on a multi-thread runtime. Size the capacity to hold
-many records — 1 MiB is what these benchmarks use. 64 KiB is already enough on a
-`current_thread` runtime, but on a multi-thread one the benefit keeps growing to ~256 KiB
-because the reader keeps parking (155 context switches per 8 MiB at 64 KiB, 34 at 1 MiB).
+**The speedup does not come from making syscalls cheaper. It comes from not rendezvousing
+with the peer and the network stack once per 16 KiB TLS record.**
 
-What you are actually paying for without it, per 16 KiB record and *not* per byte:
+OpenSSL emits one `BIO_write` per record, so an unbuffered 8 MiB write becomes 512
+`write(2)` calls. With `TCP_NODELAY` each one is a full round of ceremony: push the segment,
+run the loopback receive path, wake the peer, which drains the 16 KiB and parks again. A
+`BufWriter` turns 64 of those records into one memcpy each plus a single large `write(2)`,
+so the ceremony happens once per ~64 records instead of once per record.
 
-- **a reader wakeup.** Each `write(2)` pushes on loopback and wakes the peer, which drains
-  it and parks again — ~1 OS context switch per record on a multi-thread runtime.
-- **a trip through the TCP/loopback receive path.** Per packet, not per byte, and packets
-  cannot exceed the 64 KiB GSO ceiling.
+What that saves, measured per 8 MiB transfer on a 2-worker runtime
+(`cargo run --release --example ctxsw`):
 
-Not what you are paying for: syscall entry (~1 us, invisible here), and not the TLS records
-themselves, which stay 16 KiB either way.
+| | unbuffered | buffered (1 MiB) | saved |
+|---|---|---|---|
+| `write(2)` calls | 512 | 9 | 98% |
+| reader park/wake | 416-442 | 65-75 | 84% |
+| **OS context switches** | 350-380 | 34-37 | **90%** |
+| **loopback packets** | 757-760 | 182-187 | **76%** |
+| extra userspace memcpy | 0 | 8 MiB | −8 MiB |
 
-Consequences worth knowing:
+The two bolded rows are the ones you are buying. A cross-core wakeup costs ~5-15 us and
+there is roughly one per record; a packet costs a traversal of the TCP and loopback receive
+path, and packets shrink from 10.6 KiB to 43.6 KiB because larger writes let the stack build
+bigger GSO super-packets. Together they account for the ~15.3 us per record between the
+unbuffered path (26.5 us/record) and the buffered one (11.2 us/record).
 
-- **Below one record a `BufWriter` is pure loss** — it adds a memcpy per record and has
-  nothing to batch. Measurably slower when the capacity is too small to hold two records.
-- **The win shrinks to ~1.3x on a `current_thread` runtime**, because half of it was
-  cross-core wakeups that a single-threaded scheduler does not have.
-- **KTLS does not help here.** It moves AES-GCM into the kernel but still emits one
-  `sendmsg` per record, so it does not touch either cost above.
+**What is not saved:**
+
+- **Syscall entry.** ~1 us against a 15.3 us gap. Cutting syscalls a further 16x after the
+  packet count bottoms out changes nothing measurable.
+- **TLS records.** Still 16 KiB on the wire, still one `BIO_write` each. Only the `write(2)`
+  gets bigger.
+- **Copies.** Buffering *adds* one memcpy per record. It is a real cost — with a capacity
+  too small to batch, buffering is measurably slower than not buffering.
+
+**So, practically:** use a `BufWriter` whenever you write more than one record at a time,
+and size it to hold many — 1 MiB is what these benchmarks use. It is worth ~2.4x at 1-8 MiB
+on a multi-thread runtime, ~1.3x on a `current_thread` one (which has no cross-core wakeups
+to remove), and it is pure overhead at or below one record. KTLS does not substitute for it:
+it moves AES-GCM into the kernel but still emits one `sendmsg` per record, so it removes
+neither cost above.
 
 Evidence: [Results](#results), [Current-thread vs multi-thread](#current-thread-vs-multi-thread),
 [Where the context switches come from](#where-the-context-switches-come-from),
