@@ -154,14 +154,60 @@ Instrumenting an 8 MiB transfer (512 records) shows where it actually goes:
 closes the 15.3 us gap. Two effects compound:
 
 1. **Wakeup amplification.** With `TCP_NODELAY` every 16 KiB write pushes immediately and
-   wakes the reader. The writer then fills the send buffer, gets `EWOULDBLOCK`, registers
-   with epoll and yields. Each record therefore costs a write plus a push plus a reader
-   wakeup plus a writer reschedule — not one syscall. Batching amortises all of it.
-   The [current-thread comparison](#current-thread-vs-multi-thread) tests this directly:
-   keeping the wakeups but making them same-core recovers most of the same throughput.
+   wakes the reader, which drains it and parks again — one park/wake rendezvous per
+   record. Batching amortises it over ~64 records.
+   [Where the context switches come from](#where-the-context-switches-come-from) breaks
+   this down, and the
+   [current-thread comparison](#current-thread-vs-multi-thread) tests it by making the
+   rendezvous same-core instead of removing it.
 2. **Packet count.** Larger writes let the stack build bigger GSO super-packets, 10.6 KiB
    to 43.6 KiB here, so ~4x fewer traversals of the TCP and loopback receive path. That
    cost lands in softirq rather than in your syscall.
+
+### Where the context switches come from
+
+`cargo run --release --example ctxsw` attributes them. Per 8 MiB transfer:
+
+| Runtime | Variant | write(2) | writer blocked | reader waits | ctx switches | MiB/s |
+|---|---|---|---|---|---|---|
+| multi_thread | unbuffered | 512 | 4 | 443 | 386 | 470 |
+| multi_thread | buffered | 9 | 0.1 | 59 | 29 | 1366 |
+| multi_thread | unbuffered, `unconstrained` | 512 | **0** | 433 | 372 | 477 |
+| current_thread | unbuffered | 514 | 4 | **2** | **0.1** | 913 |
+| current_thread | buffered | 11 | 2 | 2 | 0.2 | 1163 |
+
+"Writer blocked" counts `Pending` from the client's `poll_write` (a full socket send
+buffer); "reader waits" counts `Pending` from the drain task's `poll_read` (it emptied the
+socket and parked).
+
+**The switches are the reader parking and being woken, not the writer blocking.** Two
+things follow from the table:
+
+- **The writer essentially never blocks.** The `unconstrained` row disables tokio's
+  128-operation coop budget and the count goes to exactly 0, which also identifies the
+  other rows' 4 as `512 / 128` scheduler-forced yields rather than a full send buffer. Yet
+  removing them changes neither the context switches (372 vs 386) nor the throughput
+  (477 vs 470). The send buffer is never the constraint, because the drain keeps it empty.
+- **The reader parks after almost every record.** 443 waits for 512 writes — 0.87 each.
+  The drain reads 256 KiB at a time and never decrypts, so it consumes a 16 KiB record far
+  faster than the writer can encrypt the next one. It finds the socket empty, re-arms
+  epoll and parks; the next `write(2)` pushes on loopback synchronously, calls
+  `sk_data_ready`, and wakes it. That park/wake pair is the context switch, and there is
+  one per `write(2)` — not per record and not per byte.
+
+That last distinction is the whole mechanism. **A `BufWriter` does not reduce records or
+bytes; it reduces `write(2)` calls, and the rendezvous count follows the syscall count.**
+512 writes produce 443 reader waits; 9 writes produce 59. The reader then gets 1 MiB per
+wakeup instead of 16 KiB, so one park/wake amortises over ~64 records.
+
+The `current_thread` rows confirm it from the other direction. The record count and the
+syscall count are unchanged (514 writes), but the drain task *cannot run while the writer
+runs*, so ciphertext accumulates in the socket buffer and the reader almost never finds it
+empty: 2 waits instead of 443, and 0.1 OS context switches instead of 386. The producer and
+consumer still hand off, but the handoff is a poll of another future on the same thread,
+which costs ~100 ns rather than the ~5-15 us of a cross-core wakeup. Hence the ~2x in
+[Current-thread vs multi-thread](#current-thread-vs-multi-thread) — and hence why that
+speedup disappears once a `BufWriter` has already removed the wakeups.
 
 ### What actually changes size
 
@@ -191,13 +237,18 @@ segments larger than the MSS.
 
 ### Reproducing the instrumentation
 
-The context-switch and packet counts above came from one-off instrumentation rather than a
-committed test. To repeat it, sample around the transfer:
+The context-switch, syscall and park/wake counts come from `examples/ctxsw.rs`:
 
-- context switches: sum `voluntary_ctxt_switches` + `nonvoluntary_ctxt_switches` across
-  `/proc/self/task/*/status` (the per-process `/proc/self/status` only covers the main
-  thread, and the work happens on tokio workers)
-- packets: the `lo:` receive-packet column of `/proc/net/dev`
+```sh
+cargo run --release --example ctxsw
+```
+
+It counts context switches by summing `voluntary_ctxt_switches` +
+`nonvoluntary_ctxt_switches` across `/proc/self/task/*/status` — the per-process
+`/proc/self/status` only covers the main thread, and the work happens on tokio workers.
+
+The packet counts in the first table were one-off and are not covered by the example; read
+the `lo:` receive-packet column of `/proc/net/dev` around the transfer to repeat them.
 
 ### Implication for a vectored BIO
 
