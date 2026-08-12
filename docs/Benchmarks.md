@@ -25,6 +25,10 @@ What that saves, measured per 8 MiB transfer on a 2-worker runtime
 | **loopback packets** | 757-760 | 182-187 | **76%** |
 | extra userspace memcpy | 0 | 8 MiB | −8 MiB |
 
+Counts are min-max across 3 runs; `saved` is `1 - buffered/unbuffered` on the range
+midpoints. The ranges are tight enough not to matter — taking the extremes instead gives
+89-91% for context switches and 75-76% for packets.
+
 The two bolded rows are the ones you are buying. A cross-core wakeup costs ~5-15 us and
 there is roughly one per record; a packet costs a traversal of the TCP and loopback receive
 path, and packets shrink from 10.6 KiB to 43.6 KiB because larger writes let the stack build
