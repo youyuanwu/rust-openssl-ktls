@@ -8,9 +8,14 @@
 //! - `reader-waits` — `Pending` from the drain task, i.e. it emptied the socket and parked
 //! - `ctxsw` — OS context switches summed across every thread of the process
 //!
+//! - `lo pkts` — loopback receive packets, i.e. traversals of the TCP receive path
+//!
 //! The `unbuf/uncon` row wraps the write in [`tokio::task::unconstrained`], which
 //! disables tokio's 128-operation coop budget. Any remaining `writer-blocked` there is a
 //! genuinely full send buffer rather than a scheduler-forced yield.
+//!
+//! The `BufWriter` capacity is swept so the syscall count can be varied independently of
+//! the packet count, which is what separates "fewer syscalls" from "larger pushes".
 //!
 //! Run with `cargo run --release --example ctxsw`. See `docs/Benchmarks.md`.
 
@@ -28,7 +33,6 @@ use tokio::net::{TcpListener, TcpStream};
 
 const PAYLOAD: usize = 8 << 20;
 const ITERS: usize = 20;
-const BUFWRITER_CAPACITY: usize = 1 << 20;
 const DRAIN_BUFFER: usize = 256 << 10;
 
 #[derive(Default)]
@@ -102,7 +106,19 @@ fn ctx_switches() -> u64 {
     total
 }
 
-async fn run(buffered: bool, unconstrained: bool) -> (Arc<Counts>, u64, f64) {
+/// Loopback receive-packet count. System-wide, so other `lo` traffic pollutes it.
+fn lo_packets() -> u64 {
+    let dev = std::fs::read_to_string("/proc/net/dev").unwrap();
+    for line in dev.lines() {
+        let line = line.trim_start();
+        if let Some(rest) = line.strip_prefix("lo:") {
+            return rest.split_whitespace().nth(1).unwrap().parse().unwrap();
+        }
+    }
+    0
+}
+
+async fn run(capacity: Option<usize>, unconstrained: bool) -> (Arc<Counts>, u64, u64, f64) {
     let listener = TcpListener::bind("localhost:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (cert, key) = mk_self_signed_cert(vec!["localhost".to_string()]).unwrap();
@@ -142,9 +158,9 @@ async fn run(buffered: bool, unconstrained: bool) -> (Arc<Counts>, u64, f64) {
         .into_ssl("localhost")
         .unwrap();
 
-    let mut client: Box<dyn AsyncWrite + Send + Unpin> = if buffered {
+    let mut client: Box<dyn AsyncWrite + Send + Unpin> = if let Some(capacity) = capacity {
         let s = BufWriter::with_capacity(
-            BUFWRITER_CAPACITY,
+            capacity,
             Counting {
                 inner: tcp,
                 c: c.clone(),
@@ -172,6 +188,7 @@ async fn run(buffered: bool, unconstrained: bool) -> (Arc<Counts>, u64, f64) {
     c.read_pending.store(0, Ordering::Relaxed);
 
     let before = ctx_switches();
+    let packets_before = lo_packets();
     let t0 = std::time::Instant::now();
     for _ in 0..ITERS {
         if unconstrained {
@@ -188,16 +205,34 @@ async fn run(buffered: bool, unconstrained: bool) -> (Arc<Counts>, u64, f64) {
     }
     let elapsed = t0.elapsed();
     let switches = ctx_switches() - before;
+    let packets = lo_packets() - packets_before;
 
     let mibs = (PAYLOAD * ITERS) as f64 / (1 << 20) as f64 / elapsed.as_secs_f64();
     drop(client);
     let _ = server.await;
-    (c, switches, mibs)
+    (c, switches, packets, mibs)
 }
 
 fn main() {
+    // `None` is unbuffered. A 32 KiB BufWriter cannot hold two 16 KiB records, so it
+    // flushes once per record like the unbuffered path but adds a memcpy — it isolates
+    // the buffering copy from the batching. Larger capacities batch 3, 15 and 63 records.
+    let cases: [(Option<usize>, bool); 6] = [
+        (None, false),
+        (None, true),
+        (Some(32 << 10), false),
+        (Some(64 << 10), false),
+        (Some(256 << 10), false),
+        (Some(1 << 20), false),
+    ];
+
+    println!(
+        "{:<15} {:<13} {:>8} {:>8} {:>8} {:>8} {:>9} {:>9}",
+        "runtime", "variant", "write(2)", "wblock", "rwait", "ctxsw", "lo pkts", "MiB/s"
+    );
+
     for flavor in ["current_thread", "multi_thread"] {
-        for (buffered, unconstrained) in [(false, false), (true, false), (false, true)] {
+        for (capacity, unconstrained) in cases {
             let rt = if flavor == "current_thread" {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -210,20 +245,20 @@ fn main() {
                     .build()
                     .unwrap()
             };
-            let (c, switches, mibs) = rt.block_on(run(buffered, unconstrained));
+            let (c, switches, packets, mibs) = rt.block_on(run(capacity, unconstrained));
             let per = |v: usize| v as f64 / ITERS as f64;
+            let name = match (capacity, unconstrained) {
+                (None, false) => "unbuffered".to_string(),
+                (None, true) => "unbuf/uncon".to_string(),
+                (Some(n), _) => format!("buf {} KiB", n >> 10),
+            };
             println!(
-                "{flavor:<15} {:<11} writes/xfer {:>7.1}  writer-blocked {:>7.1}  \
-                 reader-waits {:>7.1}  ctxsw/xfer {:>8.1}  {:>7.0} MiB/s",
-                match (buffered, unconstrained) {
-                    (true, _) => "buffered",
-                    (false, true) => "unbuf/uncon",
-                    (false, false) => "unbuffered",
-                },
+                "{flavor:<15} {name:<13} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>9.0} {:>9.0}",
                 per(c.writes.load(Ordering::Relaxed)),
                 per(c.write_pending.load(Ordering::Relaxed)),
                 per(c.read_pending.load(Ordering::Relaxed)),
                 switches as f64 / ITERS as f64,
+                packets as f64 / ITERS as f64,
                 mibs,
             );
         }

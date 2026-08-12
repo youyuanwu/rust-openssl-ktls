@@ -79,7 +79,9 @@ What the data does and does not support:
 
 1. **Coalescing is a large, reproducible win above one record.** `BufWriter` is roughly
    1.5x at 64 KiB and 2.4x at 1-8 MiB, with ranges nowhere near overlapping the unbuffered
-   variants. This is purely from issuing 2 syscalls instead of 64.
+   variants. What that buys is analysed in
+   [Is it just the syscall count?](#is-it-just-the-syscall-count) — it is not syscall entry
+   cost, and it is not proportional to the number of syscalls saved.
 2. **At and below one record there is nothing to coalesce**, and no variant is
    distinguishable from another at 1 KiB. The 16 KiB row spans 456-630 across variants but
    the ranges overlap heavily, so it is inconclusive rather than a real ordering.
@@ -197,7 +199,7 @@ things follow from the table:
 
 That last distinction is the whole mechanism. **A `BufWriter` does not reduce records or
 bytes; it reduces `write(2)` calls, and the rendezvous count follows the syscall count.**
-512 writes produce 443 reader waits; 9 writes produce 59. The reader then gets 1 MiB per
+512 writes produce 443 reader parks; 9 writes produce 59. The reader then gets 1 MiB per
 wakeup instead of 16 KiB, so one park/wake amortises over ~64 records.
 
 The `current_thread` rows confirm it from the other direction. The record count and the
@@ -208,6 +210,56 @@ consumer still hand off, but the handoff is a poll of another future on the same
 which costs ~100 ns rather than the ~5-15 us of a cross-core wakeup. Hence the ~2x in
 [Current-thread vs multi-thread](#current-thread-vs-multi-thread) — and hence why that
 speedup disappears once a `BufWriter` has already removed the wakeups.
+
+### Is it just the syscall count?
+
+No. Fewer syscalls is the lever, but almost none of the win is the syscall itself, and the
+benefit is not proportional to how many are removed. Sweeping the `BufWriter` capacity
+separates the effects. Counts below are per 8 MiB transfer and reproduce to within a
+percent across runs; throughput is min-max of 3 runs.
+
+| Runtime | Capacity | write(2) | ctxsw | lo packets | MiB/s |
+|---|---|---|---|---|---|
+| current_thread | unbuffered | 514 | 0.1 | 302-313 | 759-973 |
+| current_thread | 32 KiB | 514 | 0.1 | 302 | 857-1226 |
+| current_thread | 64 KiB | 172 | 0.0 | 173-176 | 1102-1397 |
+| current_thread | 256 KiB | 37 | 0.1 | 161-162 | 1170-1356 |
+| current_thread | 1 MiB | 11 | 0.1 | 153-154 | 1142-1412 |
+| multi_thread | unbuffered | 512 | 350-380 | 757-760 | 444-496 |
+| multi_thread | 32 KiB | 512 | 348-388 | 755-761 | 389-454 |
+| multi_thread | 64 KiB | 171 | 153-155 | 254-255 | 785-833 |
+| multi_thread | 256 KiB | 35 | 45-59 | 195-200 | 380-1193 |
+| multi_thread | 1 MiB | 9 | 34-37 | 182-187 | 657-1346 |
+
+The two large-capacity `multi_thread` rows are too noisy to read here — running the whole
+sweep in one process makes core placement unstable — so take their throughput from the
+[Results](#results) table instead. The counter columns are stable regardless.
+
+Three findings, in order of how much they matter:
+
+1. **The win saturates at a 64 KiB capacity, not at the smallest syscall count.** On
+   `current_thread`, going from 514 to 172 syscalls is a real jump, but 172 to 11 — a
+   further **16x** reduction — is indistinguishable (1102-1397 against 1142-1412). If the
+   syscall count were the thing being paid for, that 16x would show. It does not.
+   What stops improving at the same point is the **packet count**: 302, then 173, then 154.
+   The `lo` MTU is 65536 and that is also the GSO ceiling, so once a `write(2)` reaches
+   ~48 KiB the stack is already building maximum-size super-packets and 8 MiB cannot be
+   carried in fewer than 128 of them. Larger writes cannot buy fewer traversals of the TCP
+   and loopback receive path, which is where the per-push cost actually lands.
+2. **Buffering that does not batch is a straight loss.** A 32 KiB buffer cannot hold two
+   16 KiB records, so it flushes once per record: identical 512 syscalls, identical ~760
+   packets, identical ~370 context switches — and it adds one memcpy per record. On
+   `multi_thread` it is slower than unbuffered in all three runs (389-454 against 444-496).
+   That is the price of the copy, visible because nothing offsets it.
+3. **Syscall entry cost is invisible.** It is ~1 us against the 15.3 us per-record gap
+   computed above, and finding 1 shows a 16x change in syscall count moving nothing.
+
+So the buffered-vs-unbuffered difference decomposes into two costs that fewer, larger
+`write(2)` calls avoid — reader park/wake rendezvous, and per-packet receive-path work —
+minus one cost buffering adds, the extra memcpy. The split between the first two depends
+entirely on the runtime: on `multi_thread` the rendezvous dominates (380 context switches
+gone), while on `current_thread` there are no context switches to remove and the whole
+~1.5x is the packet path.
 
 ### What actually changes size
 
@@ -231,7 +283,9 @@ how many syscalls carry those bytes.
 
 The cost is one extra memcpy per record, which is why the benefit is size-dependent: worth
 it by 2.4x at 1-8 MiB, and pure overhead at 1 KiB and 16 KiB where there is nothing to
-batch. Note also that `TCP_NODELAY` inflates the effect by forcing a push per record; with
+batch. The 32 KiB row of the [capacity sweep](#is-it-just-the-syscall-count) prices that
+copy on its own — same syscalls, same packets, ~10% slower. Note also that `TCP_NODELAY`
+inflates the effect by forcing a push per record; with
 Nagle enabled the gap would narrow, though not much at 16 KiB since Nagle does not hold back
 segments larger than the MSS.
 
@@ -252,8 +306,10 @@ the `lo:` receive-packet column of `/proc/net/dev` around the transfer to repeat
 
 ### Implication for a vectored BIO
 
-A queuing/`writev` BIO cannot beat the `BufWriter` numbers above, because the win comes
-from issuing fewer syscalls rather than from scatter-gather. It would also have to copy
+A queuing/`writev` BIO cannot beat the `BufWriter` numbers above, because the win comes from
+issuing fewer and larger pushes rather than from scatter-gather — and it saturates once a
+push reaches the ~64 KiB loopback GSO ceiling, which a `BufWriter` already does. It would
+also have to copy
 each record into its own buffer — OpenSSL recycles `wbuf` as soon as `BIO_write` returns —
 so it buys the same syscall reduction at the same copy cost, with far more unsafe code.
 A vectored BIO would also disable KTLS, since `BIO_get_ktls_send` requires a real socket BIO.
