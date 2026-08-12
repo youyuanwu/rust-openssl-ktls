@@ -7,8 +7,11 @@ path on an async loopback TLS connection.
 # whole matrix (slow)
 cargo bench --bench write_throughput
 
-# one variant / one size
-cargo bench --bench write_throughput -- tokio_openssl_bufwriter/1048576
+# one variant / one size, both scheduler flavors
+cargo bench --bench write_throughput -- 'tokio_openssl_bufwriter_\w+/1048576'
+
+# one scheduler flavor only
+cargo bench --bench write_throughput -- current_thread
 
 # quick smoke run
 cargo bench --bench write_throughput -- --warm-up-time 1 --measurement-time 2 --sample-size 10
@@ -39,10 +42,24 @@ KTLS is also one `sendmsg` per record. Use `strace` to confirm those two directl
 | `tokio_openssl_custom_bio` | `tokio_openssl::SslStream<TcpStream>` — rust-openssl's custom BIO |
 | `tokio_openssl_bufwriter` | `tokio_openssl::SslStream<BufWriter<TcpStream>>` — coalesced |
 
+Each variant runs under both tokio schedulers, and the flavor is appended to the benchmark
+id (`tokio_openssl_bufwriter_current_thread`):
+
+| Suffix | Runtime |
+|---|---|
+| `_current_thread` | `new_current_thread` — writer and drain task share one thread |
+| `_multi_thread` | `new_multi_thread().worker_threads(2)` — they can occupy separate cores |
+
+The flavor is a dimension because the dominant cost below is the reader wakeup
+(see [Why buffering helps](#why-buffering-helps)), and what a wakeup costs depends on
+whether it crosses a core. Each flavor gets its own runtime and its own connections, since
+a `TcpStream` is bound to the reactor that registered it.
+
 ## Results
 
-Measured on OpenSSL 3.5.5, Linux loopback. Each cell is the **min-max of the median
-throughput across 3 separate process invocations**, because run-to-run variance is much
+Measured on OpenSSL 3.5.5, Linux loopback, on a **2-worker multi-thread runtime**
+(`_multi_thread`). Each cell is the **min-max of the median throughput across 3 separate
+process invocations**, because run-to-run variance is much
 larger than criterion's within-run confidence intervals — the timed region is a
 producer/consumer pipeline, so the writer's and drain task's core placement for the life of
 a process moves the result by up to ~30%. Only differences whose ranges do not overlap are
@@ -75,6 +92,45 @@ What the data does and does not support:
    any BIO indirection cost — but "overlap" is a statement about this noise floor, not a
    proof of equality.
 
+### Current-thread vs multi-thread
+
+Both flavors below come from the **same 3 process invocations on a different machine** than
+the table above, so compare across the two tables only as ratios, never as absolute numbers.
+KTLS is missing because that host has no `tls` kernel module.
+
+| Payload | socket BIO | custom BIO | + BufWriter |
+|---|---|---|---|
+| 1 KiB | 161-167 / 95-99 | 164-167 / 97-101 | 161-168 / 95-101 |
+| 16 KiB | 980-1154 / 452-516 | 1157-1185 / 486-508 | 1029-1172 / 479-706 |
+| 64 KiB | 1057-1162 / 461-735 | 720-1145 / 519-728 | 1268-1443 / 895-934 |
+| 1 MiB | 1040-1151 / 475-740 | 909-1142 / 504-733 | 1259-1574 / 1494-1511 |
+| 8 MiB | 1000-1056 / 445-691 | 914-1046 / 462-687 | 1133-1442 / 1370-1436 |
+
+(MiB/s, `current_thread` / `multi_thread`.)
+
+1. **`current_thread` is ~2x faster for every unbuffered variant, at every payload size.**
+   The ranges do not overlap anywhere in the first two columns — the largest gap is 16 KiB,
+   where the single-threaded runtime more than doubles throughput. Even the 1 KiB row,
+   where the variants are indistinguishable from each other, moves 95-101 to 161-167.
+2. **For the buffered variant the two flavors are indistinguishable at 1-8 MiB** and
+   `current_thread` wins only at 64 KiB and below.
+3. Those two facts together are a direct test of the [wakeup
+   explanation](#why-buffering-helps): the cost that `BufWriter` removes and the cost that
+   `current_thread` removes are the *same* cost. Buffering removes reader wakeups by
+   batching records into one syscall; a single-threaded runtime keeps the wakeups but makes
+   each one a same-core task switch instead of a cross-core IPI. Apply either and the
+   penalty goes; apply both and the second one buys almost nothing, which is what the
+   overlapping 1-8 MiB buffered rows show.
+4. **`BufWriter` is therefore worth much less on `current_thread`**: ~1.3x at 1 MiB against
+   ~2.4x on the multi-thread runtime. It is still a win, and still the right default for a
+   server, but the headline 2.4x is a property of the scheduler as much as of the syscall
+   count.
+
+This does not make `current_thread` a faster runtime in general — the benchmark deliberately
+puts exactly two tasks on it, and the drain task does no decryption, so a single core is
+enough to run both. A workload that can actually use the second core would not behave this
+way.
+
 ## Why buffering helps
 
 The obvious explanation — "fewer syscalls, so less syscall entry overhead" — does not
@@ -101,6 +157,8 @@ closes the 15.3 us gap. Two effects compound:
    wakes the reader. The writer then fills the send buffer, gets `EWOULDBLOCK`, registers
    with epoll and yields. Each record therefore costs a write plus a push plus a reader
    wakeup plus a writer reschedule — not one syscall. Batching amortises all of it.
+   The [current-thread comparison](#current-thread-vs-multi-thread) tests this directly:
+   keeping the wakeups but making them same-core recovers most of the same throughput.
 2. **Packet count.** Larger writes let the stack build bigger GSO super-packets, 10.6 KiB
    to 43.6 KiB here, so ~4x fewer traversals of the TCP and loopback receive path. That
    cost lands in softirq rather than in your syscall.
@@ -175,6 +233,10 @@ The following choices matter for interpreting the numbers:
   silently benchmarking the non-KTLS path. Run `sudo modprobe tls` first.
 - **One connection is reused** for every iteration and every payload size of a variant, so
   the congestion window and socket buffers are warm and are not re-measured per size.
+- **Both scheduler flavors share the same peer setup.** The drain task is `tokio::spawn`ed
+  on the runtime under test, so on `current_thread` it is driven by the same `block_on`
+  that drives the writer — the timed region then includes the drain's work rather than
+  overlapping it with a second core.
 
 Run-to-run variance between *process invocations* reaches ~30% on an otherwise idle
 machine, far exceeding criterion's reported within-run intervals. Compare min-max bands
