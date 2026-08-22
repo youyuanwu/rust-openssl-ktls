@@ -52,7 +52,7 @@ to remove), and it is pure overhead at or below one record. KTLS does not substi
 it moves AES-GCM into the kernel but still emits one `sendmsg` per record, so it removes
 neither cost above.
 
-Evidence: [Results](#results), [Current-thread vs multi-thread](#current-thread-vs-multi-thread),
+Evidence: [Historical results](#historical-results), [Current-thread vs multi-thread](#current-thread-vs-multi-thread),
 [Where the context switches come from](#where-the-context-switches-come-from),
 [Is it just the syscall count?](#is-it-just-the-syscall-count).
 
@@ -303,7 +303,8 @@ percent across runs; throughput is min-max of 3 runs.
 
 The two large-capacity `multi_thread` rows are too noisy to read here — running the whole
 sweep in one process makes core placement unstable — so take their throughput from the
-[Results](#results) table instead. The counter columns are stable regardless.
+[Historical results](#historical-results) table instead. The counter columns are stable
+regardless.
 
 Three findings, in order of how much they matter:
 
