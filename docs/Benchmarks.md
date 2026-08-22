@@ -52,7 +52,8 @@ to remove), and it is pure overhead at or below one record. KTLS does not substi
 it moves AES-GCM into the kernel but still emits one `sendmsg` per record, so it removes
 neither cost above.
 
-Evidence: [Historical results](#historical-results), [Current-thread vs multi-thread](#current-thread-vs-multi-thread),
+Evidence: [original results](benchmark-results/write-throughput/original.md),
+[current-thread vs multi-thread](benchmark-results/write-throughput/original.md#current-thread-vs-multi-thread),
 [Where the context switches come from](#where-the-context-switches-come-from),
 [Is it just the syscall count?](#is-it-just-the-syscall-count).
 
@@ -121,87 +122,16 @@ The flavor is a dimension because the dominant cost below is the reader wakeup
 whether it crosses a core. Each flavor gets its own runtime and its own connections, since
 a `TcpStream` is bound to the reactor that registered it.
 
-## Historical results
+## Results
 
-These measurements predate the `rustls_openssl` variant and cover the four OpenSSL write
-paths listed in the table. Run the comparison command above to measure the expanded matrix
-on the current machine.
+Result sets are stored together under
+[`docs/benchmark-results/write-throughput/`](benchmark-results/write-throughput/):
 
-Measured on OpenSSL 3.5.5, Linux loopback, on a **2-worker multi-thread runtime**
-(`_multi_thread`). Each cell is the **min-max of the median throughput across 3 separate
-process invocations**, because run-to-run variance is much
-larger than criterion's within-run confidence intervals — the timed region is a
-producer/consumer pipeline, so the writer's and drain task's core placement for the life of
-a process moves the result by up to ~30%. Only differences whose ranges do not overlap are
-meaningful. Absolute numbers are machine-specific.
+- [Original four-variant results](benchmark-results/write-throughput/original.md)
+- [2026-08-22 results including `rustls_openssl`](benchmark-results/write-throughput/2026-08-22-wsl2.md)
 
-| Payload | ktls | socket BIO | custom BIO | + BufWriter |
-|---|---|---|---|---|
-| 1 KiB | 79-81 | 78-90 | 77-84 | 79-100 |
-| 16 KiB | 610-622 | 603-630 | 466-616 | 456-602 |
-| 64 KiB | 607-631 | 613-646 | 458-622 | **902-968** |
-| 1 MiB | 605-608 | 592-616 | 604-613 | **1390-1517** |
-| 8 MiB | 477-494 | 568-609 | 576-608 | **1319-1471** |
-
-(MiB/s.)
-
-What the data does and does not support:
-
-1. **Coalescing is a large, reproducible win above one record.** `BufWriter` is roughly
-   1.5x at 64 KiB and 2.4x at 1-8 MiB, with ranges nowhere near overlapping the unbuffered
-   variants. What that buys is analysed in
-   [Is it just the syscall count?](#is-it-just-the-syscall-count) — it is not syscall entry
-   cost, and it is not proportional to the number of syscalls saved.
-2. **At and below one record there is nothing to coalesce**, and no variant is
-   distinguishable from another at 1 KiB. The 16 KiB row spans 456-630 across variants but
-   the ranges overlap heavily, so it is inconclusive rather than a real ordering.
-3. **KTLS is slower for very large writes.** At 8 MiB it lands at 477-494 against 568-609
-   for the plain socket BIO — reproducible across runs and non-overlapping. At every other
-   size the two are indistinguishable. This benchmark does not explain the 8 MiB result;
-   note that KTLS does not reduce the syscall count, it only moves AES-GCM into the kernel.
-4. **The two BIO designs are not distinguishable here.** This crate's native socket BIO and
-   rust-openssl's custom BIO overlap at every payload size, so the syscall count dominates
-   any BIO indirection cost — but "overlap" is a statement about this noise floor, not a
-   proof of equality.
-
-### Current-thread vs multi-thread
-
-Both flavors below come from the **same 3 process invocations on a different machine** than
-the table above, so compare across the two tables only as ratios, never as absolute numbers.
-KTLS is missing because that host has no `tls` kernel module.
-
-| Payload | socket BIO | custom BIO | + BufWriter |
-|---|---|---|---|
-| 1 KiB | 161-167 / 95-99 | 164-167 / 97-101 | 161-168 / 95-101 |
-| 16 KiB | 980-1154 / 452-516 | 1157-1185 / 486-508 | 1029-1172 / 479-706 |
-| 64 KiB | 1057-1162 / 461-735 | 720-1145 / 519-728 | 1268-1443 / 895-934 |
-| 1 MiB | 1040-1151 / 475-740 | 909-1142 / 504-733 | 1259-1574 / 1494-1511 |
-| 8 MiB | 1000-1056 / 445-691 | 914-1046 / 462-687 | 1133-1442 / 1370-1436 |
-
-(MiB/s, `current_thread` / `multi_thread`.)
-
-1. **`current_thread` is ~2x faster for every unbuffered variant, at every payload size.**
-   The ranges do not overlap anywhere in the first two columns — the largest gap is 16 KiB,
-   where the single-threaded runtime more than doubles throughput. Even the 1 KiB row,
-   where the variants are indistinguishable from each other, moves 95-101 to 161-167.
-2. **For the buffered variant the two flavors are indistinguishable at 1-8 MiB** and
-   `current_thread` wins only at 64 KiB and below.
-3. Those two facts together are a direct test of the [wakeup
-   explanation](#why-buffering-helps): the cost that `BufWriter` removes and the cost that
-   `current_thread` removes are the *same* cost. Buffering removes reader wakeups by
-   batching records into one syscall; a single-threaded runtime keeps the wakeups but makes
-   each one a same-core task switch instead of a cross-core IPI. Apply either and the
-   penalty goes; apply both and the second one buys almost nothing, which is what the
-   overlapping 1-8 MiB buffered rows show.
-4. **`BufWriter` is therefore worth much less on `current_thread`**: ~1.3x at 1 MiB against
-   ~2.4x on the multi-thread runtime. It is still a win, and still the right default for a
-   server, but the headline 2.4x is a property of the scheduler as much as of the syscall
-   count.
-
-This does not make `current_thread` a faster runtime in general — the benchmark deliberately
-puts exactly two tasks on it, and the drain task does no decryption, so a single core is
-enough to run both. A workload that can actually use the second core would not behave this
-way.
+Do not compare absolute throughput between result files. Machine, OpenSSL, and Criterion
+sampling differences make only within-file comparisons meaningful.
 
 ## Why buffering helps
 
@@ -230,8 +160,8 @@ closes the 15.3 us gap. Two effects compound:
    record. Batching amortises it over ~64 records.
    [Where the context switches come from](#where-the-context-switches-come-from) breaks
    this down, and the
-   [current-thread comparison](#current-thread-vs-multi-thread) tests it by making the
-   rendezvous same-core instead of removing it.
+   [current-thread comparison](benchmark-results/write-throughput/original.md#current-thread-vs-multi-thread)
+   tests it by making the rendezvous same-core instead of removing it.
 2. **Packet count.** Larger writes let the stack build bigger GSO super-packets, 10.6 KiB
    to 43.6 KiB here, so ~4x fewer traversals of the TCP and loopback receive path. That
    cost lands in softirq rather than in your syscall.
@@ -277,8 +207,8 @@ syscall count are unchanged (514 writes), but the drain task *cannot run while t
 runs*, so ciphertext accumulates in the socket buffer and the reader almost never finds it
 empty: 2 waits instead of 443, and 0.1 OS context switches instead of 386. The producer and
 consumer still hand off, but the handoff is a poll of another future on the same thread,
-which costs ~100 ns rather than the ~5-15 us of a cross-core wakeup. Hence the ~2x in
-[Current-thread vs multi-thread](#current-thread-vs-multi-thread) — and hence why that
+which costs ~100 ns rather than the ~5-15 us of a cross-core wakeup. Hence the ~2x in the
+[original scheduler comparison](benchmark-results/write-throughput/original.md#current-thread-vs-multi-thread) — and hence why that
 speedup disappears once a `BufWriter` has already removed the wakeups.
 
 ### Is it just the syscall count?
@@ -303,8 +233,8 @@ percent across runs; throughput is min-max of 3 runs.
 
 The two large-capacity `multi_thread` rows are too noisy to read here — running the whole
 sweep in one process makes core placement unstable — so take their throughput from the
-[Historical results](#historical-results) table instead. The counter columns are stable
-regardless.
+[original results](benchmark-results/write-throughput/original.md) instead. The counter
+columns are stable regardless.
 
 Three findings, in order of how much they matter:
 
