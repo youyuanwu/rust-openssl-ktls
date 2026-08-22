@@ -16,6 +16,8 @@ use openssl_ktls_tests::utils::{
     create_openssl_acceptor_builder, create_openssl_connector_builder,
     create_openssl_connector_with_ktls, ssl_gen::mk_self_signed_cert,
 };
+use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -39,14 +41,17 @@ enum Variant {
     CustomBio,
     /// `tokio-openssl` over a `BufWriter`: records coalesced into one `write` per flush.
     CustomBioBuffered,
+    /// `tokio-rustls` using the OpenSSL-backed rustls crypto provider.
+    RustlsOpenSsl,
 }
 
 impl Variant {
-    const ALL: [Variant; 4] = [
+    const ALL: [Variant; 5] = [
         Variant::Ktls,
         Variant::SocketBio,
         Variant::CustomBio,
         Variant::CustomBioBuffered,
+        Variant::RustlsOpenSsl,
     ];
 
     fn name(self) -> &'static str {
@@ -55,6 +60,7 @@ impl Variant {
             Variant::SocketBio => "openssl_ktls_socket_bio",
             Variant::CustomBio => "tokio_openssl_custom_bio",
             Variant::CustomBioBuffered => "tokio_openssl_bufwriter",
+            Variant::RustlsOpenSsl => "rustls_openssl",
         }
     }
 }
@@ -230,6 +236,28 @@ async fn build_client(
                     .expect("client handshake");
                 Some(Box::new(client))
             }
+        }
+        Variant::RustlsOpenSsl => {
+            let mut roots = RootCertStore::empty();
+            roots
+                .add(CertificateDer::from(
+                    cert.to_der().expect("certificate DER"),
+                ))
+                .expect("trusted certificate");
+
+            let config =
+                ClientConfig::builder_with_provider(Arc::new(rustls_openssl::default_provider()))
+                    .with_safe_default_protocol_versions()
+                    .expect("protocol versions")
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+            let server_name = ServerName::try_from("localhost").expect("server name");
+            let client = connector
+                .connect(server_name, tcp)
+                .await
+                .expect("client handshake");
+            Some(Box::new(client))
         }
     }
 }

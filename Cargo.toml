@@ -20,6 +20,9 @@ tokio-util = "0.7"
 rand = "0.10"
 criterion = { version = "0.8", features = ["async_tokio"] }
 tokio-openssl = "0.6"
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-openssl = { version = "0.4", default-features = false, features = ["tls12"] }
 compio = "0.19"
 
 # crate in this workspace
