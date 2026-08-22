@@ -1,7 +1,8 @@
 # Write-path benchmarks
 
-`openssl-ktls-tests/benches/write_throughput.rs` measures the cost of OpenSSL's write
-path on an async loopback TLS connection.
+`openssl-ktls-tests/benches/write_throughput.rs` compares async TLS write paths on a
+loopback connection, including OpenSSL's native write paths and rustls using OpenSSL as
+its crypto provider.
 
 ## Takeaway: buffered vs unbuffered
 
@@ -71,6 +72,9 @@ cargo bench --bench write_throughput -- 'tokio_openssl_bufwriter_\w+/1048576'
 # one scheduler flavor only
 cargo bench --bench write_throughput -- current_thread
 
+# compare rustls-openssl with tokio-openssl on the multi-thread scheduler
+cargo bench --bench write_throughput -- '(rustls_openssl|tokio_openssl_custom_bio)_multi_thread'
+
 # quick smoke run
 cargo bench --bench write_throughput -- --warm-up-time 1 --measurement-time 2 --sample-size 10
 
@@ -102,6 +106,7 @@ KTLS is also one `sendmsg` per record. Use `strace` to confirm those two directl
 | `openssl_ktls_socket_bio` | `TokioSslStream` without KTLS — OpenSSL's native socket BIO |
 | `tokio_openssl_custom_bio` | `tokio_openssl::SslStream<TcpStream>` — rust-openssl's custom BIO |
 | `tokio_openssl_bufwriter` | `tokio_openssl::SslStream<BufWriter<TcpStream>>` — coalesced |
+| `rustls_openssl` | `tokio_rustls::TlsStream<TcpStream>` — rustls record layer with the OpenSSL crypto provider |
 
 Each variant runs under both tokio schedulers, and the flavor is appended to the benchmark
 id (`tokio_openssl_bufwriter_current_thread`):
@@ -116,7 +121,11 @@ The flavor is a dimension because the dominant cost below is the reader wakeup
 whether it crosses a core. Each flavor gets its own runtime and its own connections, since
 a `TcpStream` is bound to the reactor that registered it.
 
-## Results
+## Historical results
+
+These measurements predate the `rustls_openssl` variant and cover the four OpenSSL write
+paths listed in the table. Run the comparison command above to measure the expanded matrix
+on the current machine.
 
 Measured on OpenSSL 3.5.5, Linux loopback, on a **2-worker multi-thread runtime**
 (`_multi_thread`). Each cell is the **min-max of the median throughput across 3 separate
