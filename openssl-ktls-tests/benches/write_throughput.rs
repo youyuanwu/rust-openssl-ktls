@@ -43,15 +43,18 @@ enum Variant {
     CustomBioBuffered,
     /// `tokio-rustls` using the OpenSSL-backed rustls crypto provider.
     RustlsOpenSsl,
+    /// `tokio-rustls` with the OpenSSL provider over a buffered transport.
+    RustlsOpenSslBuffered,
 }
 
 impl Variant {
-    const ALL: [Variant; 5] = [
+    const ALL: [Variant; 6] = [
         Variant::Ktls,
         Variant::SocketBio,
         Variant::CustomBio,
         Variant::CustomBioBuffered,
         Variant::RustlsOpenSsl,
+        Variant::RustlsOpenSslBuffered,
     ];
 
     fn name(self) -> &'static str {
@@ -61,6 +64,7 @@ impl Variant {
             Variant::CustomBio => "tokio_openssl_custom_bio",
             Variant::CustomBioBuffered => "tokio_openssl_bufwriter",
             Variant::RustlsOpenSsl => "rustls_openssl",
+            Variant::RustlsOpenSslBuffered => "rustls_openssl_bufwriter",
         }
     }
 }
@@ -237,7 +241,7 @@ async fn build_client(
                 Some(Box::new(client))
             }
         }
-        Variant::RustlsOpenSsl => {
+        Variant::RustlsOpenSsl | Variant::RustlsOpenSslBuffered => {
             let mut roots = RootCertStore::empty();
             roots
                 .add(CertificateDer::from(
@@ -253,11 +257,21 @@ async fn build_client(
                     .with_no_client_auth();
             let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
             let server_name = ServerName::try_from("localhost").expect("server name");
-            let client = connector
-                .connect(server_name, tcp)
-                .await
-                .expect("client handshake");
-            Some(Box::new(client))
+
+            if variant == Variant::RustlsOpenSsl {
+                let client = connector
+                    .connect(server_name, tcp)
+                    .await
+                    .expect("client handshake");
+                Some(Box::new(client))
+            } else {
+                let buffered = BufWriter::with_capacity(BUFWRITER_CAPACITY, tcp);
+                let client = connector
+                    .connect(server_name, buffered)
+                    .await
+                    .expect("client handshake");
+                Some(Box::new(client))
+            }
         }
     }
 }
