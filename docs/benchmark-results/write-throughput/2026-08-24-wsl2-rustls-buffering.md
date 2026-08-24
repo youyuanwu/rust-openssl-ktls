@@ -65,7 +65,7 @@ and are inconclusive.
 Buffered rustls does not produce a distinguishable win over buffered tokio-openssl in any
 row. Buffered tokio-openssl is distinguishably faster at 1 KiB and 16 KiB on
 `current_thread`, and at 1 KiB, 1 MiB, and 8 MiB on `multi_thread`. At the two large
-multi-thread payloads it is approximately 5% faster by the mean of the three medians.
+multi-thread payloads it is approximately 6% faster by the mean of the three medians.
 The remaining buffered ranges overlap and are inconclusive.
 
 ## Conclusion
