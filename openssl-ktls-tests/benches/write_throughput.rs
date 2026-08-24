@@ -17,7 +17,7 @@ use openssl_ktls_tests::utils::{
     create_openssl_connector_with_ktls, ssl_gen::mk_self_signed_cert,
 };
 use rustls::pki_types::{CertificateDer, ServerName};
-use rustls::{ClientConfig, RootCertStore};
+use rustls::{CipherSuite, ClientConfig, RootCertStore};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -45,16 +45,22 @@ enum Variant {
     RustlsOpenSsl,
     /// `tokio-rustls` with the OpenSSL provider over a buffered transport.
     RustlsOpenSslBuffered,
+    /// `tokio-rustls` using the ring crypto provider.
+    RustlsRing,
+    /// `tokio-rustls` with the ring provider over a buffered transport.
+    RustlsRingBuffered,
 }
 
 impl Variant {
-    const ALL: [Variant; 6] = [
+    const ALL: [Variant; 8] = [
         Variant::Ktls,
         Variant::SocketBio,
         Variant::CustomBio,
         Variant::CustomBioBuffered,
         Variant::RustlsOpenSsl,
         Variant::RustlsOpenSslBuffered,
+        Variant::RustlsRing,
+        Variant::RustlsRingBuffered,
     ];
 
     fn name(self) -> &'static str {
@@ -65,6 +71,8 @@ impl Variant {
             Variant::CustomBioBuffered => "tokio_openssl_bufwriter",
             Variant::RustlsOpenSsl => "rustls_openssl",
             Variant::RustlsOpenSslBuffered => "rustls_openssl_bufwriter",
+            Variant::RustlsRing => "rustls_ring",
+            Variant::RustlsRingBuffered => "rustls_ring_bufwriter",
         }
     }
 }
@@ -241,7 +249,10 @@ async fn build_client(
                 Some(Box::new(client))
             }
         }
-        Variant::RustlsOpenSsl | Variant::RustlsOpenSslBuffered => {
+        Variant::RustlsOpenSsl
+        | Variant::RustlsOpenSslBuffered
+        | Variant::RustlsRing
+        | Variant::RustlsRingBuffered => {
             let mut roots = RootCertStore::empty();
             roots
                 .add(CertificateDer::from(
@@ -249,20 +260,28 @@ async fn build_client(
                 ))
                 .expect("trusted certificate");
 
-            let config =
-                ClientConfig::builder_with_provider(Arc::new(rustls_openssl::default_provider()))
-                    .with_safe_default_protocol_versions()
-                    .expect("protocol versions")
-                    .with_root_certificates(roots)
-                    .with_no_client_auth();
+            let provider = if matches!(
+                variant,
+                Variant::RustlsOpenSsl | Variant::RustlsOpenSslBuffered
+            ) {
+                rustls_openssl::default_provider()
+            } else {
+                rustls::crypto::ring::default_provider()
+            };
+            let config = ClientConfig::builder_with_provider(Arc::new(provider))
+                .with_safe_default_protocol_versions()
+                .expect("protocol versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth();
             let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
             let server_name = ServerName::try_from("localhost").expect("server name");
 
-            if variant == Variant::RustlsOpenSsl {
+            if matches!(variant, Variant::RustlsOpenSsl | Variant::RustlsRing) {
                 let client = connector
                     .connect(server_name, tcp)
                     .await
                     .expect("client handshake");
+                assert_rustls_cipher_suite(&client);
                 Some(Box::new(client))
             } else {
                 let buffered = BufWriter::with_capacity(BUFWRITER_CAPACITY, tcp);
@@ -270,10 +289,23 @@ async fn build_client(
                     .connect(server_name, buffered)
                     .await
                     .expect("client handshake");
+                assert_rustls_cipher_suite(&client);
                 Some(Box::new(client))
             }
         }
     }
+}
+
+fn assert_rustls_cipher_suite<IO>(client: &tokio_rustls::client::TlsStream<IO>) {
+    assert_eq!(
+        client
+            .get_ref()
+            .1
+            .negotiated_cipher_suite()
+            .expect("negotiated cipher suite")
+            .suite(),
+        CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+    );
 }
 
 fn bench_write_throughput(c: &mut Criterion) {
