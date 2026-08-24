@@ -73,11 +73,8 @@ cargo bench --bench write_throughput -- 'tokio_openssl_bufwriter_\w+/1048576'
 # one scheduler flavor only
 cargo bench --bench write_throughput -- current_thread
 
-# compare rustls-openssl with tokio-openssl on the multi-thread scheduler
-cargo bench --bench write_throughput -- '(rustls_openssl|tokio_openssl_custom_bio)_multi_thread'
-
-# compare buffered and unbuffered rustls-openssl
-cargo bench --bench write_throughput -- 'rustls_openssl(_bufwriter)?_multi_thread'
+# compare rustls providers and buffering on the multi-thread scheduler
+cargo bench --bench write_throughput -- 'rustls_(openssl|ring)(_bufwriter)?_multi_thread'
 
 # quick smoke run
 cargo bench --bench write_throughput -- --warm-up-time 1 --measurement-time 2 --sample-size 10
@@ -112,6 +109,8 @@ KTLS is also one `sendmsg` per record. Use `strace` to confirm those two directl
 | `tokio_openssl_bufwriter` | `tokio_openssl::SslStream<BufWriter<TcpStream>>` — coalesced |
 | `rustls_openssl` | `tokio_rustls::TlsStream<TcpStream>` — rustls record layer with the OpenSSL crypto provider |
 | `rustls_openssl_bufwriter` | `tokio_rustls::TlsStream<BufWriter<TcpStream>>` — OpenSSL provider over a buffered transport |
+| `rustls_ring` | `tokio_rustls::TlsStream<TcpStream>` — rustls record layer with the ring crypto provider |
+| `rustls_ring_bufwriter` | `tokio_rustls::TlsStream<BufWriter<TcpStream>>` — ring provider over a buffered transport |
 
 Each variant runs under both tokio schedulers, and the flavor is appended to the benchmark
 id (`tokio_openssl_bufwriter_current_thread`):
@@ -133,7 +132,7 @@ Result sets are stored together under
 
 - [Original four-variant results](benchmark-results/write-throughput/original.md)
 - [2026-08-22 results including `rustls_openssl`](benchmark-results/write-throughput/2026-08-22-wsl2.md)
-- [2026-08-24 buffered vs unbuffered `rustls_openssl`](benchmark-results/write-throughput/2026-08-24-wsl2-rustls-buffering.md)
+- [2026-08-24 rustls provider and buffering comparison](benchmark-results/write-throughput/2026-08-24-wsl2-rustls-providers.md)
 
 Do not compare absolute throughput between result files. Machine, OpenSSL, and Criterion
 sampling differences make only within-file comparisons meaningful.
