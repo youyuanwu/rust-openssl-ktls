@@ -79,5 +79,6 @@ buffered tokio-openssl by approximately 13%. It is also distinguishably faster a
 For the common negotiated suite and this benchmark method, ring is faster than the OpenSSL
 rustls provider across nearly the entire matrix. Buffering remains important for large
 multi-thread writes regardless of provider. The best large-write result is buffered
-rustls/ring, while provider and buffering differences at noisy small multi-thread payloads
-remain inconclusive.
+rustls/ring. At small multi-thread payloads, ring's 1 KiB provider win and the OpenSSL
+provider's 16 KiB buffering regression are conclusive; only overlapping ranges are
+inconclusive.
