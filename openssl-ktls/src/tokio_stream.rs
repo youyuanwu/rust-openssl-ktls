@@ -78,8 +78,9 @@ impl SslStream {
             openssl_sys::SSL_set_bio(ssl.as_ptr(), sock_bio, sock_bio);
         }
 
-        // Create a AsyncFd for tcp stream
-        let async_fd = AsyncFd::new(std_tcp)?;
+        // SAFETY: AsyncFd owns the TcpStream, which keeps the same fd open.
+        // The socket BIO uses BIO_NOCLOSE and cannot close it.
+        let async_fd = unsafe { AsyncFd::register(std_tcp)? };
 
         Ok(SslStream { ssl, async_fd })
     }
